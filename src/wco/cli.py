@@ -11,19 +11,22 @@ import sys
 import tempfile
 import tomllib
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path, PurePath
 from typing import Callable, Iterator, Mapping, Sequence, TextIO
 
 from filelock import FileLock
 
 from . import __version__
+from .presentation import Output, PortRow, PsRow, StackRow
 
 
 CONFIG_NAME = ".wco.toml"
 LEGACY_CONFIG_NAME = ".bcompose.toml"
 LEGACY_STATE_DIRECTORY = "bcompose"
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 STARTUP_COMMANDS = ("up", "create", "start", "restart", "run", "watch")
 COMPOSE_COMMANDS = {
@@ -105,6 +108,8 @@ class IsolationConfig:
     port_step: int
     max_slots: int
     ports: dict[str, int]
+    rewrite_container_names: bool
+    rewrite_ports: bool
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,14 @@ class Invocation:
     slot: int | None
     ports: dict[str, int]
     environment: dict[str, str]
+
+
+@dataclass(frozen=True)
+class IsolationOverride:
+    path: Path
+    names: dict[str, str]
+    ports: dict[str, tuple[dict[str, object], ...]]
+    rewritten_ports: int
 
 
 def _table(data: Mapping[str, object], name: str) -> Mapping[str, object]:
@@ -265,13 +278,29 @@ def load_config(path: Path) -> WorkspaceConfig:
     _validate_relative_checks(startup_required, "validation.startup_required")
 
     isolation_table = _table(data, "isolation")
-    _only_keys(isolation_table, {"port_step", "max_slots", "ports"}, "[isolation]")
+    _only_keys(
+        isolation_table,
+        {
+            "port_step",
+            "max_slots",
+            "ports",
+            "rewrite_container_names",
+            "rewrite_ports",
+        },
+        "[isolation]",
+    )
     port_step = isolation_table.get("port_step", 100)
     max_slots = isolation_table.get("max_slots", 500)
+    rewrite_container_names = isolation_table.get("rewrite_container_names", False)
+    rewrite_ports = isolation_table.get("rewrite_ports", False)
     if not isinstance(port_step, int) or isinstance(port_step, bool) or port_step <= 0:
         raise WcoError("'isolation.port_step' must be a positive integer.")
     if not isinstance(max_slots, int) or isinstance(max_slots, bool) or max_slots <= 0:
         raise WcoError("'isolation.max_slots' must be a positive integer.")
+    if not isinstance(rewrite_container_names, bool):
+        raise WcoError("'isolation.rewrite_container_names' must be a boolean.")
+    if not isinstance(rewrite_ports, bool):
+        raise WcoError("'isolation.rewrite_ports' must be a boolean.")
     ports_table = isolation_table.get("ports", {})
     if not isinstance(ports_table, dict):
         raise WcoError("'isolation.ports' must be a TOML table.")
@@ -284,6 +313,14 @@ def load_config(path: Path) -> WorkspaceConfig:
         if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
             raise WcoError(f"Isolation port '{name}' must be an integer from 1 to 65535.")
         ports[name] = value
+    duplicate_ports = sorted(
+        port for port in set(ports.values()) if list(ports.values()).count(port) > 1
+    )
+    if duplicate_ports:
+        raise WcoError(
+            "Each [isolation.ports] base port must be unique; duplicate value(s): "
+            f"{', '.join(map(str, duplicate_ports))}."
+        )
 
     return WorkspaceConfig(
         path=path,
@@ -293,7 +330,13 @@ def load_config(path: Path) -> WorkspaceConfig:
         instance_name=instance_name,
         environment=environment,
         validation=ValidationConfig(required, startup_required, startup_commands),
-        isolation=IsolationConfig(port_step, max_slots, ports),
+        isolation=IsolationConfig(
+            port_step,
+            max_slots,
+            ports,
+            rewrite_container_names,
+            rewrite_ports,
+        ),
     )
 
 
@@ -322,15 +365,15 @@ def find_config(worktree: Path) -> Path:
     )
 
 
-def compose_command(arguments: Sequence[str]) -> str | None:
+def _compose_command_index(arguments: Sequence[str]) -> int | None:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
         if argument == "--":
             index += 1
-            return arguments[index] if index < len(arguments) else None
+            return index if index < len(arguments) else None
         if argument in COMPOSE_COMMANDS:
-            return argument
+            return index
         if argument in COMPOSE_OPTIONS_WITH_VALUES:
             index += 2
             continue
@@ -341,9 +384,14 @@ def compose_command(arguments: Sequence[str]) -> str | None:
             index += 1
             continue
         if not argument.startswith("-"):
-            return argument
+            return index
         index += 1
     return None
+
+
+def compose_command(arguments: Sequence[str]) -> str | None:
+    index = _compose_command_index(arguments)
+    return arguments[index] if index is not None else None
 
 
 def reject_reserved_arguments(arguments: Sequence[str]) -> None:
@@ -448,9 +496,6 @@ files = [{compose_value}]
 project_name = {project_value}
 instance_name = {project_value}
 
-[environment]
-SOURCE_PATH = "{{worktree}}"
-
 [validation]
 required = []
 startup_required = []
@@ -492,11 +537,11 @@ def _write_initial_config(path: Path, content: str, force: bool) -> None:
             os.unlink(temporary_name)
 
 
-def _init_command(arguments: Sequence[str], cwd: Path | None, stdout: TextIO) -> int:
+def _init_command(arguments: Sequence[str], cwd: Path | None, output: Output) -> int:
     if any(argument in {"-h", "--help"} for argument in arguments[1:]):
         if len(arguments) != 2:
             raise WcoError("'--help' cannot be combined with other wco init options.")
-        print(INIT_HELP, file=stdout, end="")
+        output.help(INIT_HELP)
         return 0
 
     requested_compose, requested_project, force = _parse_init_arguments(arguments)
@@ -519,14 +564,7 @@ def _init_command(arguments: Sequence[str], cwd: Path | None, stdout: TextIO) ->
         _initial_config(compose_file, project_name),
         force,
     )
-    print(f"Created {config_path}", file=stdout)
-    print(f"Compose file: {compose_file}", file=stdout)
-    print(f"Project: {project_name}", file=stdout)
-    print(
-        "Next: update your Compose bind mounts to use ${SOURCE_PATH} and add any "
-        "published port variables to [isolation.ports].",
-        file=stdout,
-    )
+    output.initialized(config_path, compose_file, project_name)
     return 0
 
 
@@ -540,6 +578,10 @@ def state_file(environ: Mapping[str, str] | None = None) -> Path:
         if root:
             return Path(root).expanduser() / "wco" / "ports.json"
     return Path.home() / ".local" / "state" / "wco" / "ports.json"
+
+
+def override_directory(environ: Mapping[str, str] | None = None) -> Path:
+    return state_file(environ).parent / "overrides"
 
 
 def legacy_state_file(environ: Mapping[str, str] | None = None) -> Path:
@@ -706,6 +748,57 @@ class PortStore:
             f"No free isolated port slot is available within slots 1-{config.isolation.max_slots}."
         )
 
+    def _refresh_assignment(
+        self,
+        data: Mapping[str, object],
+        assignment: dict[str, object],
+        config: WorkspaceConfig,
+    ) -> bool:
+        slot = int(assignment["slot"])
+        expected = {
+            name: base + slot * config.isolation.port_step
+            for name, base in config.isolation.ports.items()
+        }
+        current = {
+            str(name): int(value)
+            for name, value in dict(assignment.get("ports", {})).items()
+        }
+        if current == expected:
+            return False
+        if slot < 1 or slot > config.isolation.max_slots or any(
+            port > 65535 for port in expected.values()
+        ):
+            raise WcoError(
+                "The isolated port configuration changed and the remembered slot is no "
+                "longer valid. Run 'wco --isolated down', then 'wco ports reallocate'."
+            )
+        assignments = data["assignments"]
+        assert isinstance(assignments, list)
+        reserved = {
+            int(port)
+            for item in assignments
+            if item is not assignment
+            and isinstance(item, dict)
+            and isinstance(item.get("ports"), dict)
+            for port in item["ports"].values()
+            if isinstance(port, int)
+        }
+        own_ports = set(current.values())
+        unavailable = sorted(
+            port
+            for port in expected.values()
+            if port in reserved
+            or (port not in own_ports and not self.availability(port))
+        )
+        if unavailable:
+            raise WcoError(
+                "The isolated port configuration changed, but the remembered slot's new "
+                f"port(s) are unavailable: {', '.join(map(str, unavailable))}. Run "
+                "'wco --isolated down', then 'wco ports reallocate'."
+            )
+        assignment["ports"] = expected
+        return True
+
     def get_or_allocate(self, config: WorkspaceConfig, worktree: Path) -> tuple[int, dict[str, int]]:
         with self._locked():
             data = self._read()
@@ -715,6 +808,8 @@ class PortStore:
             if assignment is None:
                 assignment = self._allocate(data, config, worktree)
                 changed = True
+            else:
+                changed = self._refresh_assignment(data, assignment, config) or changed
             if changed:
                 self._write(data)
             return int(assignment["slot"]), {
@@ -727,15 +822,48 @@ class PortStore:
             data = self._read()
             changed = self._upgrade_config_paths(data)
             changed = self._prune(data) or changed
-            if changed:
-                self._write(data)
             assignment = self._find(data, config, worktree)
             if assignment is None:
+                if changed:
+                    self._write(data)
                 return None
+            changed = self._refresh_assignment(data, assignment, config) or changed
+            if changed:
+                self._write(data)
             return int(assignment["slot"]), {
                 str(name): int(value)
                 for name, value in dict(assignment["ports"]).items()
             }
+
+    def list_assignments(
+        self, config: WorkspaceConfig
+    ) -> list[tuple[Path, int, dict[str, int]]]:
+        """Every recorded assignment for this workspace, as stored.
+
+        Unlike get(), stored ports are reported verbatim: listing another
+        worktree's assignment must never rewrite it.
+        """
+        with self._locked():
+            data = self._read()
+            changed = self._upgrade_config_paths(data)
+            changed = self._prune(data) or changed
+            if changed:
+                self._write(data)
+            assignments = data["assignments"]
+            assert isinstance(assignments, list)
+            listed = [
+                (
+                    Path(str(item["worktree"])),
+                    int(item["slot"]),
+                    {
+                        str(name): int(value)
+                        for name, value in dict(item["ports"]).items()
+                    },
+                )
+                for item in assignments
+                if isinstance(item, dict) and item.get("config") == str(config.path)
+            ]
+            return sorted(listed, key=lambda entry: str(entry[0]))
 
     def reallocate(self, config: WorkspaceConfig, worktree: Path) -> tuple[int, dict[str, int]]:
         with self._locked():
@@ -803,6 +931,197 @@ def default_port_store() -> PortStore:
     return PortStore(migrate_legacy_state())
 
 
+def _compose_global_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
+    command_index = _compose_command_index(arguments)
+    if command_index is None:
+        raise WcoError("Docker Compose arguments are required.")
+    return tuple(arguments[:command_index])
+
+
+def _uses_stdin_compose_file(arguments: Sequence[str]) -> bool:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"-f", "--file"}:
+            if index + 1 < len(arguments) and arguments[index + 1] == "-":
+                return True
+            index += 2
+            continue
+        if argument == "-f-" or argument == "--file=-":
+            return True
+        index += 1
+    return False
+
+
+def _container_override_path(
+    invocation: Invocation,
+    directory: Path,
+) -> Path:
+    context = json.dumps(
+        {
+            "config": str(invocation.config.path),
+            "worktree": str(invocation.worktree),
+            "files": [str(path) for path in invocation.config.compose_files],
+            "global_arguments": _compose_global_arguments(invocation.compose_args),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(context.encode()).hexdigest()[:16]
+    return directory / f"{digest}.compose.yaml"
+
+
+def _generated_container_name(
+    instance_name: str,
+    original_name: str,
+    service: str,
+    used: set[str],
+    max_length: int = 63,
+) -> str:
+    raw = f"{instance_name}-{original_name}"
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._")
+    if not normalized or not normalized[0].isalnum():
+        normalized = f"container-{normalized}".rstrip("-._")
+    candidate = normalized
+    if len(candidate) > max_length or candidate in used:
+        digest = hashlib.sha256(
+            f"{service}\0{raw}".encode()
+        ).hexdigest()[:8]
+        readable = normalized[: max_length - len(digest) - 1].rstrip("-._")
+        candidate = f"{readable or 'container'}-{digest}"
+    if not CONTAINER_NAME_RE.fullmatch(candidate):
+        raise WcoError(
+            f"Cannot generate a valid isolated container name for service '{service}'."
+        )
+    used.add(candidate)
+    return candidate
+
+
+def _container_name_mappings(
+    invocation: Invocation,
+    rendered: Mapping[str, object],
+) -> dict[str, str]:
+    services = rendered.get("services", {})
+    if not isinstance(services, dict):
+        raise WcoError("Docker Compose rendered an invalid services definition.")
+    used = {
+        value
+        for definition in services.values()
+        if isinstance(definition, dict)
+        for value in [definition.get("container_name")]
+        if isinstance(value, str)
+        and (
+            invocation.project_name in value
+            or invocation.instance_name in value
+        )
+    }
+    mappings: dict[str, str] = {}
+    for service in sorted(services):
+        definition = services[service]
+        if not isinstance(service, str) or not isinstance(definition, dict):
+            continue
+        container_name = definition.get("container_name")
+        if not isinstance(container_name, str):
+            continue
+        if (
+            invocation.project_name in container_name
+            or invocation.instance_name in container_name
+        ):
+            continue
+        mappings[service] = _generated_container_name(
+            invocation.instance_name,
+            container_name,
+            service,
+            used,
+        )
+    return mappings
+
+
+def _port_mappings(
+    invocation: Invocation,
+    rendered: Mapping[str, object],
+) -> tuple[dict[str, tuple[dict[str, object], ...]], int]:
+    if not invocation.config.isolation.rewrite_ports:
+        return {}, 0
+    services = rendered.get("services", {})
+    if not isinstance(services, dict):
+        raise WcoError("Docker Compose rendered an invalid services definition.")
+    allocated_by_base = {
+        base: invocation.ports[name]
+        for name, base in invocation.config.isolation.ports.items()
+        if name in invocation.ports
+    }
+    mappings: dict[str, tuple[dict[str, object], ...]] = {}
+    rewritten = 0
+    for service in sorted(services):
+        definition = services[service]
+        if not isinstance(service, str) or not isinstance(definition, dict):
+            continue
+        ports = definition.get("ports", [])
+        if not isinstance(ports, list):
+            continue
+        replacements: list[dict[str, object]] = []
+        service_rewritten = 0
+        for port in ports:
+            if not isinstance(port, dict):
+                continue
+            replacement = dict(port)
+            try:
+                published = int(port.get("published"))
+            except (TypeError, ValueError):
+                replacements.append(replacement)
+                continue
+            allocated = allocated_by_base.get(published)
+            if allocated is not None and allocated != published:
+                replacement["published"] = str(allocated)
+                service_rewritten += 1
+            replacements.append(replacement)
+        if service_rewritten:
+            mappings[service] = tuple(replacements)
+            rewritten += service_rewritten
+    return mappings, rewritten
+
+
+def _write_isolation_override(path: Path, override: IsolationOverride) -> None:
+    content = ["services:"]
+    services = sorted(set(override.names) | set(override.ports))
+    for service in services:
+        content.append(f"  {json.dumps(service)}:")
+        container_name = override.names.get(service)
+        if container_name is not None:
+            content.append(f"    container_name: {json.dumps(container_name)}")
+        ports = override.ports.get(service)
+        if ports is not None:
+            content.append("    ports: !override")
+            for port in ports:
+                content.append(f"      - {json.dumps(port, sort_keys=True)}")
+    document = "\n".join(content) + "\n"
+    temporary_name: str | None = None
+    with _exclusive_lock(path.with_suffix(".lock"), "isolation override"):
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=path.parent,
+                prefix="isolation.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_name = handle.name
+                handle.write(document)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_name, 0o644)
+            os.replace(temporary_name, path)
+            temporary_name = None
+        except OSError as exc:
+            raise WcoError(
+                f"Cannot write isolation override '{path}': {exc}"
+            ) from exc
+        finally:
+            if temporary_name and os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+
 def build_compose_prefix(
     config: WorkspaceConfig, project_name: str, project_directory: Path
 ) -> list[str]:
@@ -811,6 +1130,106 @@ def build_compose_prefix(
         command.extend(["--file", str(compose_file)])
     command.extend(["--project-directory", str(project_directory)])
     return command
+
+
+def build_invocation_command(
+    invocation: Invocation,
+    override: IsolationOverride | None = None,
+    compose_args: Sequence[str] | None = None,
+) -> list[str]:
+    arguments = list(invocation.compose_args if compose_args is None else compose_args)
+    command_index = _compose_command_index(arguments)
+    if command_index is None:
+        raise WcoError("Docker Compose arguments are required.")
+    command = build_compose_prefix(
+        invocation.config,
+        invocation.project_name,
+        invocation.worktree,
+    )
+    command.extend(arguments[:command_index])
+    if override is not None:
+        command.extend(["--file", str(override.path)])
+    command.extend(arguments[command_index:])
+    return command
+
+
+def _render_compose_config(
+    invocation: Invocation,
+    override: IsolationOverride | None,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    *,
+    all_profiles: bool,
+) -> dict[str, object]:
+    arguments = list(_compose_global_arguments(invocation.compose_args))
+    if all_profiles:
+        arguments.extend(["--profile", "*"])
+    arguments.extend(["config", "--format", "json"])
+    command = build_invocation_command(invocation, override, arguments)
+    try:
+        result = run_process(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=invocation.environment,
+        )
+    except OSError as exc:
+        raise WcoError(f"Cannot run Docker Compose: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Docker Compose could not render the configuration."
+        raise WcoError(detail)
+    try:
+        rendered = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WcoError(
+            f"Docker Compose returned invalid JSON during isolation preparation: {exc}"
+        ) from exc
+    if not isinstance(rendered, dict):
+        raise WcoError("Docker Compose returned an invalid configuration model.")
+    return rendered
+
+
+def prepare_isolation_override(
+    invocation: Invocation,
+    run_process: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    directory: Path | None = None,
+) -> IsolationOverride | None:
+    if (
+        not invocation.isolated
+        or not (
+            invocation.config.isolation.rewrite_container_names
+            or invocation.config.isolation.rewrite_ports
+        )
+    ):
+        return None
+    run_process = run_process or subprocess.run
+    global_arguments = _compose_global_arguments(invocation.compose_args)
+    if _uses_stdin_compose_file(global_arguments):
+        raise WcoError(
+            "Isolation rewriting cannot be used with '--file -'. "
+            "Use a named Compose file instead."
+        )
+    rendered = _render_compose_config(
+        invocation,
+        None,
+        run_process,
+        all_profiles=True,
+    )
+    names = (
+        _container_name_mappings(invocation, rendered)
+        if invocation.config.isolation.rewrite_container_names
+        else {}
+    )
+    ports, rewritten_ports = _port_mappings(invocation, rendered)
+    if not names and not ports:
+        return None
+    path = _container_override_path(
+        invocation,
+        (directory or override_directory()).resolve(),
+    )
+    override = IsolationOverride(path, names, ports, rewritten_ports)
+    _write_isolation_override(path, override)
+    return override
 
 
 def _render_environment(
@@ -885,7 +1304,12 @@ def _published_ports(project_name: str) -> set[int]:
     }
 
 
-def _validate_isolated_start(invocation: Invocation) -> None:
+def _validate_isolated_start(
+    invocation: Invocation,
+    override: IsolationOverride | None = None,
+    run_process: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    run_process = run_process or subprocess.run
     own_ports = _published_ports(invocation.project_name)
     conflicts = [
         port
@@ -899,24 +1323,13 @@ def _validate_isolated_start(invocation: Invocation) -> None:
             "'wco ports reallocate'."
         )
 
-    prefix = build_compose_prefix(
-        invocation.config, invocation.project_name, invocation.worktree
+    rendered = _render_compose_config(
+        invocation,
+        override,
+        run_process,
+        all_profiles=False,
     )
-    result = subprocess.run(
-        [*prefix, "config", "--format", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=invocation.environment,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or "Docker Compose could not render the configuration."
-        raise WcoError(detail)
-    try:
-        rendered = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise WcoError(f"Docker Compose returned invalid JSON during isolation validation: {exc}") from exc
-    services = rendered.get("services", {}) if isinstance(rendered, dict) else {}
+    services = rendered.get("services", {})
     collisions: list[str] = []
     unconfigured_ports: set[int] = set()
     configured_ports = set(invocation.ports.values())
@@ -944,16 +1357,27 @@ def _validate_isolated_start(invocation: Invocation) -> None:
                     if numeric_port and numeric_port not in configured_ports:
                         unconfigured_ports.add(numeric_port)
     if collisions:
+        if invocation.config.isolation.rewrite_container_names:
+            raise WcoError(
+                "Generated isolation override did not resolve fixed container name(s): "
+                f"{', '.join(collisions)}."
+            )
         raise WcoError(
             "Isolated mode found fixed container name(s): "
             f"{', '.join(collisions)}. Remove 'container_name' or parameterize it with "
             "an [environment] value containing '{instance}'."
         )
     if unconfigured_ports:
+        guidance = (
+            "Add every fixed host port as a base value in [isolation.ports], or "
+            "parameterize it in the Compose file."
+            if invocation.config.isolation.rewrite_ports
+            else "Parameterize and register every fixed host port before using --isolated."
+        )
         raise WcoError(
             "Isolated mode found published host port(s) that are not declared in "
             f"[isolation.ports]: {', '.join(map(str, sorted(unconfigured_ports)))}. "
-            "Parameterize and register every fixed host port before using --isolated."
+            f"{guidance}"
         )
 
 
@@ -1001,47 +1425,205 @@ def prepare_invocation(
     )
 
 
-def _print_ports(
-    stream: TextIO,
-    heading: str,
-    project_name: str,
+def _parse_port_arguments(arguments: Sequence[str]) -> tuple[str, str, bool]:
+    if len(arguments) < 2 or arguments[1] not in {"show", "reallocate"}:
+        raise WcoError(
+            "Usage: wco ports <show|reallocate> [--all] [--format table|json]"
+        )
+    action = arguments[1]
+    output_format = "table"
+    format_seen = False
+    all_worktrees = False
+    index = 2
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"-a", "--all"}:
+            if action != "show":
+                raise WcoError("'--all' is only valid for 'wco ports show'.")
+            all_worktrees = True
+            index += 1
+            continue
+        if argument == "--format":
+            if index + 1 >= len(arguments):
+                raise WcoError("'--format' requires a value.")
+            value = arguments[index + 1]
+            index += 2
+        elif argument.startswith("--format="):
+            value = argument.split("=", 1)[1]
+            index += 1
+        else:
+            raise WcoError(f"Unknown wco ports option: {argument}")
+        if format_seen:
+            raise WcoError("'--format' may only be specified once.")
+        if value not in {"table", "json"}:
+            raise WcoError("'--format' must be either 'table' or 'json'.")
+        output_format = value
+        format_seen = True
+    return action, output_format, all_worktrees
+
+
+def _port_rows(
+    mode: str,
+    project: str,
     slot: int | None,
     ports: Mapping[str, int],
-) -> None:
-    print(heading, file=stream)
-    print(f"  project: {project_name}", file=stream)
-    if slot is not None:
-        print(f"  slot: {slot}", file=stream)
-    if ports:
-        for name, port in sorted(ports.items()):
-            print(f"  {name}: {port}", file=stream)
-    else:
-        print("  ports: none configured", file=stream)
+    status: str,
+    worktree: str = "-",
+    branch: str = "-",
+) -> list[PortRow]:
+    slot_value = str(slot) if slot is not None else "-"
+    if not ports:
+        return [
+            PortRow(mode, project, slot_value, "-", "-", status, worktree, branch)
+        ]
+    return [
+        PortRow(
+            mode, project, slot_value, name, str(port), status, worktree, branch
+        )
+        for name, port in sorted(ports.items())
+    ]
 
 
-def _port_command(arguments: Sequence[str], cwd: Path | None, stdout: TextIO) -> int:
-    if len(arguments) != 2 or arguments[1] not in {"show", "reallocate"}:
-        raise WcoError("Usage: wco ports <show|reallocate>")
+def _write_json(stream: TextIO, value: Mapping[str, object]) -> None:
+    json.dump(value, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+
+
+def _show_all_ports(
+    config: WorkspaceConfig,
+    worktree: Path,
+    store: PortStore,
+    output: Output,
+    stdout: TextIO,
+    output_format: str,
+    run_process: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> int:
+    run_process = run_process or subprocess.run
+    assignments = store.list_assignments(config)
+    configured = set(config.isolation.ports)
+    entries = [
+        {
+            "worktree": str(assigned_worktree),
+            "branch": _worktree_branch(str(assigned_worktree), run_process),
+            "project": _isolated_name(config.project_name, assigned_worktree),
+            "slot": slot,
+            "ports": dict(sorted(ports.items())),
+            "status": "allocated" if set(ports) == configured else "outdated",
+        }
+        for assigned_worktree, slot, ports in assignments
+    ]
+    if output_format == "json":
+        _write_json(
+            stdout,
+            {
+                "worktree": str(worktree),
+                "shared": {
+                    "project": config.project_name,
+                    "slot": None,
+                    "ports": dict(sorted(config.isolation.ports.items())),
+                },
+                "isolated": entries,
+            },
+        )
+        return 0
+
+    rows = _port_rows(
+        "shared",
+        config.project_name,
+        None,
+        config.isolation.ports,
+        "configured" if config.isolation.ports else "not configured",
+    )
+    for entry in entries:
+        rows.extend(
+            _port_rows(
+                "isolated",
+                str(entry["project"]),
+                int(str(entry["slot"])),
+                entry["ports"],  # type: ignore[arg-type]
+                str(entry["status"]),
+                str(entry["worktree"]),
+                str(entry["branch"]),
+            )
+        )
+    output.ports(
+        "Port assignments  all worktrees",
+        rows,
+        show_worktree=True,
+        current_worktree=worktree,
+    )
+    if not entries:
+        output.hint(
+            "No worktree has an isolated port slot yet. Run 'wco --isolated up -d' "
+            "in a worktree to allocate one."
+        )
+    return 0
+
+
+def _port_command(
+    arguments: Sequence[str],
+    cwd: Path | None,
+    output: Output,
+    stdout: TextIO,
+    run_process: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int:
+    action, output_format, all_worktrees = _parse_port_arguments(arguments)
     worktree = resolve_worktree((cwd or Path.cwd()).resolve())
     config = load_config(find_config(worktree))
     validate_worktree(config, worktree, None)
     store = default_port_store()
     isolated_project = _isolated_name(config.project_name, worktree)
 
-    if arguments[1] == "show":
-        _print_ports(
-            stdout,
-            "Shared:",
+    if action == "show" and all_worktrees:
+        return _show_all_ports(
+            config, worktree, store, output, stdout, output_format, run_process
+        )
+
+    if action == "show":
+        assignment = store.get(config, worktree) if config.isolation.ports else None
+        if assignment is None:
+            isolated_slot, isolated_ports, allocated = None, {}, False
+        else:
+            isolated_slot, isolated_ports = assignment
+            allocated = True
+        if output_format == "json":
+            _write_json(
+                stdout,
+                {
+                    "worktree": str(worktree),
+                    "shared": {
+                        "project": config.project_name,
+                        "slot": None,
+                        "ports": dict(sorted(config.isolation.ports.items())),
+                    },
+                    "isolated": {
+                        "project": isolated_project,
+                        "allocated": allocated,
+                        "slot": isolated_slot,
+                        "ports": dict(sorted(isolated_ports.items())),
+                    },
+                },
+            )
+            return 0
+        shared_status = "configured" if config.isolation.ports else "not configured"
+        isolated_status = "allocated" if allocated else "not allocated"
+        rows = _port_rows(
+            "shared",
             config.project_name,
             None,
             config.isolation.ports,
+            shared_status,
         )
-        assignment = store.get(config, worktree) if config.isolation.ports else None
-        if assignment is None:
-            _print_ports(stdout, "Isolated (not allocated):", isolated_project, None, {})
-        else:
-            slot, ports = assignment
-            _print_ports(stdout, "Isolated:", isolated_project, slot, ports)
+        rows.extend(
+            _port_rows(
+                "isolated",
+                isolated_project,
+                isolated_slot,
+                isolated_ports,
+                isolated_status,
+            )
+        )
+        output.ports("Port assignments", rows)
         return 0
 
     if not config.isolation.ports:
@@ -1052,7 +1634,568 @@ def _port_command(arguments: Sequence[str], cwd: Path | None, stdout: TextIO) ->
             "before reallocating its ports."
         )
     slot, ports = store.reallocate(config, worktree)
-    _print_ports(stdout, "Reallocated isolated ports:", isolated_project, slot, ports)
+    if output_format == "json":
+        _write_json(
+            stdout,
+            {
+                "worktree": str(worktree),
+                "isolated": {
+                    "project": isolated_project,
+                    "allocated": True,
+                    "slot": slot,
+                    "ports": dict(sorted(ports.items())),
+                },
+            },
+        )
+    else:
+        output.ports(
+            "Reallocated isolated ports",
+            _port_rows("isolated", isolated_project, slot, ports, "allocated"),
+        )
+    return 0
+
+
+def _parse_stacks_arguments(arguments: Sequence[str]) -> tuple[bool, str]:
+    include_stopped = False
+    output_format = "table"
+    format_seen = False
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"-a", "--all"}:
+            include_stopped = True
+            index += 1
+            continue
+        if argument == "--format":
+            if index + 1 >= len(arguments):
+                raise WcoError("'--format' requires a value.")
+            value = arguments[index + 1]
+            index += 2
+        elif argument.startswith("--format="):
+            value = argument.split("=", 1)[1]
+            index += 1
+        else:
+            raise WcoError(f"Unknown wco stacks option: {argument}")
+        if format_seen:
+            raise WcoError("'--format' may only be specified once.")
+        if value not in {"table", "json"}:
+            raise WcoError("'--format' must be either 'table' or 'json'.")
+        output_format = value
+        format_seen = True
+    return include_stopped, output_format
+
+
+def _compose_container_ids(
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    *,
+    include_stopped: bool,
+) -> list[str]:
+    command = ["docker", "ps"]
+    if include_stopped:
+        command.append("-a")
+    command.extend(
+        [
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{.ID}}",
+        ]
+    )
+    try:
+        result = run_process(command, check=False, capture_output=True, text=True)
+    except OSError as exc:
+        raise WcoError(f"Cannot run Docker: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Docker returned an error."
+        raise WcoError(f"Cannot list Docker Compose containers: {detail}")
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _container_label(inspection: Mapping[str, object], label: str) -> str:
+    config = inspection.get("Config", {})
+    if not isinstance(config, dict):
+        return ""
+    labels = config.get("Labels", {})
+    if not isinstance(labels, dict):
+        return ""
+    value = labels.get(label)
+    return value if isinstance(value, str) else ""
+
+
+def _stack_mode(config: WorkspaceConfig, project: str, worktree: str) -> str | None:
+    if project == config.project_name:
+        return "shared"
+    if worktree != "-" and project == _isolated_name(
+        config.project_name, Path(worktree)
+    ):
+        return "isolated"
+    return None
+
+
+def _stack_rows(
+    config: WorkspaceConfig,
+    inspections: Mapping[str, Mapping[str, object]],
+    ids: Sequence[str],
+    now: datetime,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+) -> list[StackRow]:
+    rows: list[StackRow] = []
+    branches: dict[str, str] = {}
+    for container_id in ids:
+        inspection = inspections.get(container_id)
+        if inspection is None:
+            continue
+        worktree = _container_worktree(inspection)
+        project = _container_label(inspection, "com.docker.compose.project")
+        mode = _stack_mode(config, project, worktree)
+        if mode is None:
+            continue
+        status, state, health = _container_status({}, inspection, now)
+        name = str(inspection.get("Name") or container_id[:12] or "-").lstrip("/")
+        if worktree not in branches:
+            branches[worktree] = _worktree_branch(worktree, run_process)
+        rows.append(
+            StackRow(
+                name=name,
+                status=status,
+                state=state,
+                health=health,
+                worktree=worktree,
+                branch=branches[worktree],
+                mode=mode,
+                project=project,
+            )
+        )
+    rows.sort(key=lambda row: (row.mode != "shared", row.worktree, row.name))
+    return rows
+
+
+def _is_down_all(arguments: Sequence[str]) -> bool:
+    """True for 'wco --isolated down --all', which Compose itself has no flag for."""
+    command_index = _compose_command_index(arguments)
+    if command_index is None or arguments[command_index] != "down":
+        return False
+    return "--all" in arguments[command_index + 1 :]
+
+
+def _isolated_worktrees(
+    config: WorkspaceConfig,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    output: Output,
+) -> list[Path]:
+    """Every worktree with an isolated slot or an isolated container."""
+    worktrees: list[Path] = [
+        worktree for worktree, _slot, _ports in default_port_store().list_assignments(config)
+    ]
+    ids = _compose_container_ids(run_process, include_stopped=True)
+    inspections = _inspect_containers(ids, run_process, output)
+    for container_id in ids:
+        inspection = inspections.get(container_id)
+        if inspection is None:
+            continue
+        worktree = _container_worktree(inspection)
+        project = _container_label(inspection, "com.docker.compose.project")
+        if _stack_mode(config, project, worktree) != "isolated":
+            continue
+        candidate = Path(worktree)
+        if candidate not in worktrees:
+            worktrees.append(candidate)
+    return sorted(worktrees, key=str)
+
+
+def _isolated_down_all(
+    arguments: Sequence[str],
+    cwd: Path | None,
+    output: Output,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+) -> int:
+    compose_args = [argument for argument in arguments if argument != "--all"]
+    worktree = resolve_worktree((cwd or Path.cwd()).resolve())
+    config = load_config(find_config(worktree))
+    targets = _isolated_worktrees(config, run_process, output)
+    if not targets:
+        output.hint("No worktree has an isolated stack for this workspace.")
+        return 0
+
+    status = 0
+    for target in targets:
+        if not target.is_dir():
+            output.warning(
+                f"Skipping '{target}': the worktree no longer exists. Remove its "
+                "containers with 'docker compose -p <project> down'."
+            )
+            status = status or 1
+            continue
+        invocation = prepare_invocation(compose_args, True, target)
+        if invocation.config.path != config.path:
+            output.warning(
+                f"Skipping '{target}': it belongs to workspace "
+                f"'{invocation.config.path}'."
+            )
+            continue
+        override = prepare_isolation_override(invocation, run_process)
+        _print_context(output, invocation, override, target)
+        result = run_process(
+            build_invocation_command(invocation, override),
+            check=False,
+            env=invocation.environment,
+        )
+        if result.returncode != 0:
+            status = status or result.returncode
+    return status
+
+
+def _stacks_command(
+    arguments: Sequence[str],
+    cwd: Path | None,
+    output: Output,
+    stdout: TextIO,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    now: datetime,
+) -> int:
+    if len(arguments) > 1 and arguments[1] in {"-h", "--help"}:
+        output.help(STACKS_HELP)
+        return 0
+    include_stopped, output_format = _parse_stacks_arguments(arguments)
+    worktree = resolve_worktree((cwd or Path.cwd()).resolve())
+    config = load_config(find_config(worktree))
+    ids = _compose_container_ids(run_process, include_stopped=include_stopped)
+    inspections = _inspect_containers(ids, run_process, output)
+    rows = _stack_rows(config, inspections, ids, now, run_process)
+    if output_format == "json":
+        _write_json(
+            stdout,
+            {
+                "worktree": str(worktree),
+                "project": config.project_name,
+                "containers": [
+                    {
+                        "mode": row.mode,
+                        "project": row.project,
+                        "name": row.name,
+                        "status": row.status,
+                        "state": row.state,
+                        "health": row.health,
+                        "worktree": None if row.worktree == "-" else row.worktree,
+                        "branch": None if row.branch == "-" else row.branch,
+                    }
+                    for row in rows
+                ],
+            },
+        )
+        return 0
+    output.stacks(rows, current_worktree=worktree)
+    return 0
+
+
+def _ps_uses_native_output(arguments: Sequence[str], output: Output) -> bool:
+    if not output.stdout.is_terminal:
+        return True
+    command_index = _compose_command_index(arguments)
+    if command_index is None or arguments[command_index] != "ps":
+        return True
+    output_options = {"-q", "--quiet", "--services", "-h", "--help", "--dry-run"}
+    for argument in arguments[command_index + 1 :]:
+        if argument in output_options or argument == "--format":
+            return True
+        if argument.startswith("--format="):
+            return True
+    return False
+
+
+def _ps_json_arguments(arguments: Sequence[str]) -> list[str]:
+    command_index = _compose_command_index(arguments)
+    if command_index is None or arguments[command_index] != "ps":
+        raise WcoError("Cannot locate the Docker Compose ps command.")
+    return [
+        *arguments[: command_index + 1],
+        "--format",
+        "json",
+        *arguments[command_index + 1 :],
+    ]
+
+
+def _parse_ps_json(content: str) -> list[dict[str, object]]:
+    content = content.strip()
+    if not content:
+        return []
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, dict):
+        return [decoded]
+    if isinstance(decoded, list) and all(isinstance(item, dict) for item in decoded):
+        return list(decoded)
+
+    rows: list[dict[str, object]] = []
+    try:
+        for line in content.splitlines():
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError("a row is not a JSON object")
+            rows.append(item)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise WcoError(f"Docker Compose returned invalid ps JSON: {exc}") from exc
+    return rows
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value or value.startswith("0001-"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _duration(value: datetime | None, now: datetime) -> str:
+    if value is None:
+        return ""
+    seconds = max(0, int((now - value).total_seconds()))
+    units = (
+        (365 * 24 * 60 * 60, "year"),
+        (30 * 24 * 60 * 60, "month"),
+        (7 * 24 * 60 * 60, "week"),
+        (24 * 60 * 60, "day"),
+        (60 * 60, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    )
+    for size, name in units:
+        if seconds >= size:
+            count = seconds // size
+            suffix = "" if count == 1 else "s"
+            return f"{count} {name}{suffix}"
+    return "less than a second"
+
+
+def _container_status(
+    item: Mapping[str, object],
+    inspection: Mapping[str, object],
+    now: datetime,
+) -> tuple[str, str, str]:
+    inspect_state = inspection.get("State", {})
+    if not isinstance(inspect_state, dict):
+        inspect_state = {}
+    state = str(item.get("State") or inspect_state.get("Status") or "unknown").lower()
+    inspect_health = inspect_state.get("Health", {})
+    if not isinstance(inspect_health, dict):
+        inspect_health = {}
+    health = str(item.get("Health") or inspect_health.get("Status") or "").lower()
+    try:
+        exit_code = int(item.get("ExitCode", inspect_state.get("ExitCode", 0)))
+    except (TypeError, ValueError):
+        exit_code = 0
+
+    if state == "running":
+        age = _duration(_parse_datetime(inspect_state.get("StartedAt")), now)
+        status = f"Up {age}" if age else "Up"
+        if health:
+            status += f" ({health})"
+    elif state == "exited":
+        age = _duration(_parse_datetime(inspect_state.get("FinishedAt")), now)
+        status = f"Exited ({exit_code})"
+        if age:
+            status += f" {age} ago"
+    else:
+        status = state.title()
+        if health:
+            status += f" ({health})"
+    return status, state, health
+
+
+def _container_worktree(inspection: Mapping[str, object]) -> str:
+    working_dir = _container_label(
+        inspection, "com.docker.compose.project.working_dir"
+    )
+    if working_dir:
+        return working_dir
+    config_files = _container_label(
+        inspection, "com.docker.compose.project.config_files"
+    )
+    first = config_files.split(",")[0].strip()
+    if first:
+        parent = str(PurePath(first).parent)
+        if parent not in {"", "."}:
+            return parent
+    return "-"
+
+
+def _worktree_branch(
+    worktree: str,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+) -> str:
+    if worktree == "-" or not Path(worktree).is_dir():
+        return "-"
+    try:
+        result = run_process(
+            ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return "-"
+    if result.returncode != 0:
+        return "-"
+    branch = result.stdout.strip()
+    if branch and branch != "HEAD":
+        return branch
+    try:
+        detached = run_process(
+            ["git", "-C", worktree, "rev-parse", "--short", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return "-"
+    revision = detached.stdout.strip() if detached.returncode == 0 else ""
+    return f"({revision})" if revision else "-"
+
+
+def _worktree_branches(
+    rows: Sequence[PsRow],
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, str]:
+    branches: dict[str, str] = {}
+    for row in rows:
+        if row.worktree not in branches:
+            branches[row.worktree] = _worktree_branch(row.worktree, run_process)
+    return branches
+
+
+def _ps_rows(
+    items: Sequence[Mapping[str, object]],
+    inspections: Mapping[str, Mapping[str, object]],
+    now: datetime,
+) -> list[PsRow]:
+    rows: list[PsRow] = []
+    for item in items:
+        container_id = str(item.get("ID") or "")
+        inspection = inspections.get(container_id, {})
+        status, state, health = _container_status(item, inspection, now)
+        rows.append(
+            PsRow(
+                name=str(item.get("Name") or container_id[:12] or "-"),
+                status=status,
+                state=state,
+                health=health,
+                worktree=_container_worktree(inspection),
+            )
+        )
+    return rows
+
+
+def _inspect_containers(
+    ids: Sequence[str],
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    output: Output,
+) -> dict[str, Mapping[str, object]]:
+    if not ids:
+        return {}
+    result = run_process(
+        ["docker", "inspect", "--type", "container", *ids],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    inspections: list[object] = []
+    if result.stdout.strip():
+        try:
+            decoded = json.loads(result.stdout)
+            if isinstance(decoded, list):
+                inspections = decoded
+        except json.JSONDecodeError:
+            pass
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "one or more containers disappeared"
+        output.warning(f"Could not enrich every container: {detail}")
+    indexed: dict[str, Mapping[str, object]] = {}
+    for item in inspections:
+        if not isinstance(item, dict) or not isinstance(item.get("Id"), str):
+            continue
+        full_id = str(item["Id"])
+        indexed[full_id] = item
+        for requested_id in ids:
+            if full_id.startswith(requested_id):
+                indexed[requested_id] = item
+    return indexed
+
+
+def _print_context(
+    output: Output,
+    invocation: Invocation,
+    override: IsolationOverride | None,
+    worktree: Path | None,
+) -> None:
+    output.context(
+        worktree,
+        invocation.project_name,
+        invocation.isolated,
+        invocation.slot,
+        len(override.names) if override is not None else 0,
+        override.rewritten_ports if override is not None else 0,
+        current_worktree=invocation.worktree,
+    )
+
+
+def _run_pretty_ps(
+    invocation: Invocation,
+    override: IsolationOverride | None,
+    output: Output,
+    stdout: TextIO,
+    stderr: TextIO,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    now: datetime,
+) -> int:
+    json_arguments = _ps_json_arguments(invocation.compose_args)
+    json_command = build_invocation_command(
+        invocation,
+        override,
+        json_arguments,
+    )
+    result = run_process(
+        json_command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=invocation.environment,
+    )
+    if result.returncode != 0:
+        _print_context(output, invocation, override, invocation.worktree)
+        if result.stderr:
+            stderr.write(result.stderr)
+            stderr.flush()
+        if result.stdout:
+            stdout.write(result.stdout)
+            stdout.flush()
+        return result.returncode
+
+    items = _parse_ps_json(result.stdout)
+    ids = [str(item.get("ID")) for item in items if item.get("ID")]
+    inspections = _inspect_containers(ids, run_process, output)
+    rows = _ps_rows(items, inspections, now)
+    branches = _worktree_branches(rows, run_process)
+    rows = [replace(row, branch=branches[row.worktree]) for row in rows]
+    _print_context(output, invocation, override, None)
+    if result.stderr:
+        stderr.write(result.stderr)
+        stderr.flush()
+    output.ps(
+        rows,
+        no_trunc="--no-trunc" in invocation.compose_args,
+        current_worktree=invocation.worktree,
+    )
     return 0
 
 
@@ -1068,9 +2211,22 @@ Options:
 """
 
 
+STACKS_HELP = """Usage: wco stacks [-a|--all] [--format table|json]
+
+List every container this workspace owns, in the shared project and in each
+worktree's isolated project, with the worktree and branch it runs from.
+
+Options:
+  -a, --all        Include stopped containers.
+  --format FORMAT  Select table or JSON output.
+  -h, --help       Show this help.
+"""
+
+
 HELP = """Usage: wco [--isolated] <docker compose arguments>
        wco init [--compose PATH] [--project NAME] [--force]
-       wco ports <show|reallocate>
+       wco ports <show|reallocate> [--all] [--format table|json]
+       wco stacks [--all] [--format table|json]
 
 Run a workspace's central Docker Compose configuration against the current
 Git worktree. The nearest .wco.toml at or above the worktree defines the
@@ -1078,6 +2234,10 @@ Compose files, environment, validation rules, and isolated ports.
 
 Options:
   --isolated   Use a worktree-specific project name and persistent port slot.
+  --format     Select table or JSON output for wco ports and wco stacks.
+  --all        Bring down every worktree's isolated stack
+               (wco --isolated down --all), list every worktree's port slot
+               (wco ports show), or include stopped containers (wco stacks).
   -h, --help   Show this help.
   --version    Show the installed wco version.
 
@@ -1086,7 +2246,10 @@ Examples:
   wco up -d --build --force-recreate
   wco --isolated up -d
   wco --isolated down
+  wco --isolated down --all
   wco ports show
+  wco ports show --all
+  wco stacks --all
 """
 
 
@@ -1097,22 +2260,34 @@ def run(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
     exec_fn: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execvpe,
+    run_process: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    output = Output(stdout, stderr)
     try:
         if not arguments:
-            print(HELP, file=stderr, end="")
+            output.help(HELP, error=True)
             return 2
         if arguments in (["-h"], ["--help"]):
-            print(HELP, file=stdout, end="")
+            output.help(HELP)
             return 0
         if arguments == ["--version"]:
-            print(f"wco {__version__}", file=stdout)
+            output.version(__version__)
             return 0
         if arguments[0] == "init":
-            return _init_command(arguments, cwd, stdout)
+            return _init_command(arguments, cwd, output)
         if arguments[0] == "ports":
-            return _port_command(arguments, cwd, stdout)
+            return _port_command(arguments, cwd, output, stdout, run_process)
+        if arguments[0] == "stacks":
+            return _stacks_command(
+                arguments,
+                cwd,
+                output,
+                stdout,
+                run_process,
+                now_fn() if now_fn is not None else datetime.now(timezone.utc),
+            )
 
         isolated = False
         if arguments and arguments[0] == "--isolated":
@@ -1120,24 +2295,50 @@ def run(
             arguments.pop(0)
         if not arguments:
             raise WcoError("Docker Compose arguments are required.")
+        if isolated and _is_down_all(arguments):
+            return _isolated_down_all(arguments, cwd, output, run_process)
 
         invocation = prepare_invocation(arguments, isolated, cwd)
-        if isolated and invocation.compose_command in invocation.config.validation.startup_commands:
-            _validate_isolated_start(invocation)
-        command = [
-            *build_compose_prefix(
-                invocation.config, invocation.project_name, invocation.worktree
-            ),
-            *invocation.compose_args,
-        ]
-        print(f"Using worktree: {invocation.worktree}", file=stderr)
-        print(f"Compose project: {invocation.project_name}", file=stderr)
-        if invocation.slot is not None:
-            print(f"Isolated port slot: {invocation.slot}", file=stderr)
+        override = prepare_isolation_override(invocation, run_process)
+        is_startup = (
+            isolated
+            and invocation.compose_command
+            in invocation.config.validation.startup_commands
+        )
+        if is_startup:
+            _validate_isolated_start(invocation, override, run_process)
+        command = build_invocation_command(invocation, override)
+        uses_pretty_ps = not _ps_uses_native_output(invocation.compose_args, output)
+        if not uses_pretty_ps:
+            _print_context(output, invocation, override, invocation.worktree)
+        if is_startup and override is not None:
+            if override.names:
+                output.warning(
+                    f"Rewriting {len(override.names)} fixed container name(s) for "
+                    "isolated mode; exact-name-dependent tooling may need adjustment."
+                )
+            if override.rewritten_ports:
+                output.warning(
+                    f"Rotating {override.rewritten_ports} fixed published host "
+                    "port(s) for isolated mode."
+                )
+        if uses_pretty_ps:
+            current_time = (
+                now_fn() if now_fn is not None else datetime.now(timezone.utc)
+            )
+            return _run_pretty_ps(
+                invocation,
+                override,
+                output,
+                stdout,
+                stderr,
+                run_process,
+                current_time,
+            )
         exec_fn(command[0], command, invocation.environment)
         return 0
     except WcoError as exc:
-        print(f"wco: error: {exc}", file=stderr)
+        output.error(str(exc))
         return 1
 
 
