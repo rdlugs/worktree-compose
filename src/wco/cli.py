@@ -803,11 +803,13 @@ def default_port_store() -> PortStore:
     return PortStore(migrate_legacy_state())
 
 
-def build_compose_prefix(config: WorkspaceConfig, project_name: str) -> list[str]:
+def build_compose_prefix(
+    config: WorkspaceConfig, project_name: str, project_directory: Path
+) -> list[str]:
     command = ["docker", "compose", "--project-name", project_name]
     for compose_file in config.compose_files:
         command.extend(["--file", str(compose_file)])
-    command.extend(["--project-directory", str(config.workspace)])
+    command.extend(["--project-directory", str(project_directory)])
     return command
 
 
@@ -897,7 +899,9 @@ def _validate_isolated_start(invocation: Invocation) -> None:
             "'wco ports reallocate'."
         )
 
-    prefix = build_compose_prefix(invocation.config, invocation.project_name)
+    prefix = build_compose_prefix(
+        invocation.config, invocation.project_name, invocation.worktree
+    )
     result = subprocess.run(
         [*prefix, "config", "--format", "json"],
         check=False,
@@ -1121,7 +1125,9 @@ def run(
         if isolated and invocation.compose_command in invocation.config.validation.startup_commands:
             _validate_isolated_start(invocation)
         command = [
-            *build_compose_prefix(invocation.config, invocation.project_name),
+            *build_compose_prefix(
+                invocation.config, invocation.project_name, invocation.worktree
+            ),
             *invocation.compose_args,
         ]
         print(f"Using worktree: {invocation.worktree}", file=stderr)

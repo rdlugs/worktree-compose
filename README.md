@@ -46,10 +46,11 @@ wco init --compose deploy/compose.yml --project example
 wco init --force
 ```
 
-Initialization never changes the Compose file. Afterward, update its worktree
-bind mounts to use `${SOURCE_PATH}` and declare parameterized published ports
-under `[isolation.ports]`. Existing `.wco.toml` files are not replaced unless
-`--force` is supplied.
+Initialization never changes the Compose file. Relative Compose paths such as
+`./` resolve from the active worktree. `${SOURCE_PATH}` is also available when
+an explicit absolute worktree path is useful. Declare parameterized published
+ports under `[isolation.ports]`. Existing `.wco.toml` files are not replaced
+unless `--force` is supplied.
 
 ## Use
 

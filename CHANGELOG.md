@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve relative Docker Compose paths from the active Git worktree instead
+  of the directory containing the central Compose configuration.
+
 ## [1.1.0] - 2026-08-02
 
 ### Added

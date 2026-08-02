@@ -404,6 +404,11 @@ class InvocationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(captured["file"], "docker")
         self.assertEqual(captured["args"][-2:], ["config", "--services"])
+        project_directory = captured["args"].index("--project-directory")
+        self.assertEqual(
+            captured["args"][project_directory + 1],
+            str(self.fixture.main.resolve()),
+        )
         environment = captured["environment"]
         self.assertEqual(environment["SOURCE_PATH"], str(self.fixture.main.resolve()))
         self.assertIn("Using worktree:", stderr.getvalue())
