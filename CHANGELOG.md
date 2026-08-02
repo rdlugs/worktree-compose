@@ -7,11 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-08-02
+### Added
+
+- Native support for macOS and Windows, including Windows workflows through
+  WSL2, with CI coverage on macOS and native Windows.
 
 ### Changed
 
-- Promoted the successfully validated `v1.0.0-rc.1` release candidate to the first stable release.
+- Replaced Unix-only port-state locking with cross-platform native file locks.
+- Store native Windows state under `%LOCALAPPDATA%` by default.
 
 ## [1.0.0-rc.1] - 2026-08-02
 

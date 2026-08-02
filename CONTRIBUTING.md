@@ -4,7 +4,8 @@ Thank you for helping improve `wco`.
 
 ## Development setup
 
-`wco` requires Python 3.11 or newer, Git, Docker, and Docker Compose v2.
+`wco` requires Python 3.11 or newer, Git, Docker, and Docker Compose v2. It can
+be developed on Linux, macOS, native Windows, or WSL2.
 
 Clone the repository, then install the command in editable mode:
 
@@ -17,16 +18,14 @@ uv tool install --editable --force .
 Run the complete test suite from the repository root:
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -v
-python3 -m py_compile src/wco/*.py tests/*.py
+uv run --no-project --with-editable . python -m unittest discover -v
+uv run --no-project --with-editable . python -m compileall -q src tests
 ```
 
-Build and inspect the release distributions when changing packaging:
+Build the release distributions when changing packaging:
 
 ```bash
 uv build --clear
-tar -tzf dist/wco-*.tar.gz
-unzip -l dist/wco-*.whl
 ```
 
 ## Pull requests
