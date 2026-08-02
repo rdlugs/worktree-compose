@@ -91,7 +91,7 @@ class WorkspaceFixture:
 class InitTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.workspace = Path(self.temporary.name) / "My Workspace"
+        self.workspace = (Path(self.temporary.name) / "My Workspace").resolve()
         self.workspace.mkdir()
 
     def tearDown(self) -> None:
