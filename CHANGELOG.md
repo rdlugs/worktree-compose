@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-02
+
+### Changed
+
+- Promoted the successfully validated `v1.0.0-rc.1` release candidate to the first stable release.
+
 ## [1.0.0-rc.1] - 2026-08-02
 
 ### Added
@@ -52,7 +58,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Configurable Compose files, environment templates, and worktree validation.
 - Port inspection and explicit reallocation commands.
 
-[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/rdlugs/worktree-compose/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/rdlugs/worktree-compose/releases/tag/v1.0.0-rc.1
 [0.3.0]: https://github.com/rdlugs/worktree-compose/releases/tag/v0.3.0
 [0.2.0]: https://github.com/rdlugs/worktree-compose/releases/tag/v0.2.0
