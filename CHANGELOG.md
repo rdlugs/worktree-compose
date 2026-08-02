@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-03
+
 ### Added
 
 - Add terminal-aware, colored output for WCO context, initialization, port
@@ -107,7 +109,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Configurable Compose files, environment templates, and worktree validation.
 - Port inspection and explicit reallocation commands.
 
-[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/rdlugs/worktree-compose/compare/v1.1.0...v1.2.0
 [1.1.1]: https://github.com/rdlugs/worktree-compose/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/rdlugs/worktree-compose/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/rdlugs/worktree-compose/compare/v1.0.0-rc.1...v1.0.0
