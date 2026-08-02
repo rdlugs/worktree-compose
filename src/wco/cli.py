@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -11,9 +10,12 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Sequence, TextIO
+from typing import Callable, Iterator, Mapping, Sequence, TextIO
+
+from filelock import FileLock
 
 from . import __version__
 
@@ -82,6 +84,20 @@ COMPOSE_FILE_CANDIDATES = (
 
 class WcoError(Exception):
     """An expected command-line or configuration error."""
+
+
+@contextmanager
+def _exclusive_lock(path: Path, subject: str) -> Iterator[None]:
+    lock = FileLock(str(path), timeout=-1)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock.acquire()
+    except OSError as exc:
+        raise WcoError(f"Cannot lock {subject} '{path}': {exc}") from exc
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 @dataclass(frozen=True)
@@ -519,6 +535,10 @@ def state_file(environ: Mapping[str, str] | None = None) -> Path:
     root = environ.get("XDG_STATE_HOME")
     if root:
         return Path(root).expanduser() / "wco" / "ports.json"
+    if sys.platform == "win32":
+        root = environ.get("LOCALAPPDATA")
+        if root:
+            return Path(root).expanduser() / "wco" / "ports.json"
     return Path.home() / ".local" / "state" / "wco" / "ports.json"
 
 
@@ -527,6 +547,10 @@ def legacy_state_file(environ: Mapping[str, str] | None = None) -> Path:
     root = environ.get("XDG_STATE_HOME")
     if root:
         return Path(root).expanduser() / LEGACY_STATE_DIRECTORY / "ports.json"
+    if sys.platform == "win32":
+        root = environ.get("LOCALAPPDATA")
+        if root:
+            return Path(root).expanduser() / LEGACY_STATE_DIRECTORY / "ports.json"
     return (
         Path.home()
         / ".local"
@@ -593,19 +617,8 @@ class PortStore:
             if temporary_name and os.path.exists(temporary_name):
                 os.unlink(temporary_name)
 
-    def _locked(self):
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            lock_path = self.path.with_suffix(".lock")
-            handle = lock_path.open("a+")
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            except OSError:
-                handle.close()
-                raise
-            return handle
-        except OSError as exc:
-            raise WcoError(f"Cannot lock port state '{self.path}': {exc}") from exc
+    def _locked(self) -> AbstractContextManager[None]:
+        return _exclusive_lock(self.path.with_suffix(".lock"), "port state")
 
     @staticmethod
     def _upgrade_config_paths(data: dict[str, object]) -> bool:
@@ -756,13 +769,11 @@ def migrate_legacy_state(environ: Mapping[str, str] | None = None) -> Path:
 
     legacy_lock = legacy.with_suffix(".lock")
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
         destination_lock = destination.with_suffix(".lock")
-        legacy.parent.mkdir(parents=True, exist_ok=True)
-        with destination_lock.open("a+") as destination_handle:
-            fcntl.flock(destination_handle.fileno(), fcntl.LOCK_EX)
-            with legacy_lock.open("a+") as legacy_handle:
-                fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_EX)
+        with _exclusive_lock(
+            destination_lock, "destination port state"
+        ):
+            with _exclusive_lock(legacy_lock, "legacy port state"):
                 if destination.exists():
                     raise WcoError(
                         "The current port state appeared during legacy migration; "

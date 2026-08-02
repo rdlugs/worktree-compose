@@ -5,6 +5,13 @@ worktree contains the current directory. It is project-agnostic: every Docker
 workspace defines its own Compose files, environment variables, validation
 rules, and isolated port set in `.wco.toml`.
 
+## Supported platforms
+
+`wco` supports Linux, macOS, native Windows through PowerShell or Command
+Prompt, and Windows through WSL2. Python 3.11 or newer, Git, Docker, and Docker
+Compose v2 are required. Use Docker Desktop on macOS and Windows; enable its
+WSL integration when running `wco` inside WSL2.
+
 ## Install
 
 Install a self-contained copy with [`uv`](https://docs.astral.sh/uv/):
@@ -19,8 +26,8 @@ While developing `wco`, install it in editable mode instead:
 uv tool install --editable /path/to/wco-source
 ```
 
-Make sure `~/.local/bin` is on `PATH`. Reinstall a non-editable installation
-after updating the source package.
+Run `uv tool update-shell` if the installed command is not on `PATH`. Reinstall
+a non-editable installation after updating the source package.
 
 ## Initialize a workspace
 
@@ -135,8 +142,9 @@ project-scoped names.
 
 The first isolated worktree receives each base port plus one `port_step`, the
 next receives the lowest available slot, and assignments remain stable under
-`$XDG_STATE_HOME/wco/ports.json` (or
-`~/.local/state/wco/ports.json`).
+`$XDG_STATE_HOME/wco/ports.json` when configured. The defaults are
+`~/.local/state/wco/ports.json` on Linux, macOS, and WSL2, and
+`%LOCALAPPDATA%\wco\ports.json` on native Windows.
 
 `wco` controls Docker Compose's project name, so `-p` and
 `--project-name` are intentionally rejected. Other Docker Compose arguments

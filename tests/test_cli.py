@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import subprocess
 import tempfile
 import unittest
@@ -46,6 +47,24 @@ max_slots = 5
 HTTP_PORT = 8000
 DEV_PORT = 5000
 """
+
+
+def _allocate_port_worker(
+    state_path: str,
+    config_path: str,
+    worktree: str,
+    start_event,
+    result_queue,
+) -> None:
+    try:
+        if not start_event.wait(timeout=20):
+            raise RuntimeError("Timed out waiting to start concurrent allocation.")
+        store = PortStore(Path(state_path), availability=lambda _port: True)
+        config = load_config(Path(config_path))
+        slot, ports = store.get_or_allocate(config, Path(worktree))
+        result_queue.put(("ok", slot, ports))
+    except Exception as exc:
+        result_queue.put(("error", repr(exc), {}))
 
 
 class WorkspaceFixture:
@@ -222,6 +241,76 @@ class PortStoreTests(unittest.TestCase):
         self.store.get_or_allocate(self.config, self.fixture.main)
         replacement = self.store.reallocate(self.config, self.fixture.main)
         self.assertEqual(replacement, (2, {"HTTP_PORT": 8200, "DEV_PORT": 5200}))
+
+    def test_lock_errors_are_reported_as_wco_errors(self) -> None:
+        with patch("wco.cli.FileLock") as lock_class:
+            lock_class.return_value.acquire.side_effect = OSError("access denied")
+            with self.assertRaisesRegex(WcoError, "Cannot lock port state"):
+                self.store.get(self.config, self.fixture.main)
+
+    def test_concurrent_processes_allocate_distinct_slots(self) -> None:
+        feature = self.fixture.create_repo("feature")
+        context = multiprocessing.get_context("spawn")
+        start_event = context.Event()
+        result_queue = context.Queue()
+        processes = [
+            context.Process(
+                target=_allocate_port_worker,
+                args=(
+                    str(self.state),
+                    str(self.config.path),
+                    str(worktree),
+                    start_event,
+                    result_queue,
+                ),
+            )
+            for worktree in (self.fixture.main, feature)
+        ]
+
+        for process in processes:
+            process.start()
+        start_event.set()
+        try:
+            results = [result_queue.get(timeout=30) for _process in processes]
+        finally:
+            for process in processes:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        self.assertEqual([process.exitcode for process in processes], [0, 0])
+        self.assertEqual({result[0] for result in results}, {"ok"})
+        self.assertEqual({result[1] for result in results}, {1, 2})
+        state = json.loads(self.state.read_text())
+        self.assertEqual(len(state["assignments"]), 2)
+        self.assertEqual(
+            {assignment["slot"] for assignment in state["assignments"]},
+            {1, 2},
+        )
+
+
+class StatePathTests(unittest.TestCase):
+    def test_xdg_state_home_takes_precedence_on_windows(self) -> None:
+        with patch("wco.cli.sys.platform", "win32"):
+            current = state_file(
+                {"XDG_STATE_HOME": "/custom/state", "LOCALAPPDATA": "/windows/state"}
+            )
+            legacy = legacy_state_file(
+                {"XDG_STATE_HOME": "/custom/state", "LOCALAPPDATA": "/windows/state"}
+            )
+
+        self.assertEqual(current, Path("/custom/state/wco/ports.json"))
+        self.assertEqual(legacy, Path("/custom/state/bcompose/ports.json"))
+
+    def test_windows_uses_local_app_data_by_default(self) -> None:
+        local_app_data = Path("C:/Users/example/AppData/Local")
+        with patch("wco.cli.sys.platform", "win32"):
+            current = state_file({"LOCALAPPDATA": str(local_app_data)})
+            legacy = legacy_state_file({"LOCALAPPDATA": str(local_app_data)})
+
+        self.assertEqual(current, local_app_data / "wco" / "ports.json")
+        self.assertEqual(legacy, local_app_data / "bcompose" / "ports.json")
 
 
 class StateMigrationTests(unittest.TestCase):
