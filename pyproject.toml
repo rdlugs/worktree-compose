@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wco"
+version = "0.3.0"
+description = "Run a central Docker Compose stack against the current Git worktree"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/rdlugs/worktree-compose"
+Repository = "https://github.com/rdlugs/worktree-compose.git"
+Issues = "https://github.com/rdlugs/worktree-compose/issues"
+Changelog = "https://github.com/rdlugs/worktree-compose/blob/main/CHANGELOG.md"
+
+[project.scripts]
+wco = "wco.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wco"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/wco",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
