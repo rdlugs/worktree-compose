@@ -6,8 +6,8 @@ Security fixes are provided for the latest released version of `wco`.
 
 | Version | Supported |
 | --- | --- |
-| 0.3.x | Yes |
-| Earlier versions | No |
+| 1.0.0 release candidates | Yes |
+| 0.3.x and earlier | No |
 
 ## Reporting a vulnerability
 
