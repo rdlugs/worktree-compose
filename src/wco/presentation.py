@@ -87,6 +87,7 @@ class PsRow:
     health: str
     worktree: str = "-"
     branch: str = "-"
+    id: str = "-"
 
 
 @dataclass(frozen=True)
@@ -257,11 +258,13 @@ class Output:
         name_overrides: int = 0,
         port_overrides: int = 0,
         *,
+        stack_id: int | None = None,
         current_worktree: Path | None = None,
     ) -> None:
         mode = "isolated" if isolated else "shared"
         badge = Text.assemble(
             (mode, "magenta" if isolated else "cyan"),
+            (f"  stack {stack_id}", LABEL_STYLE) if stack_id is not None else "",
             (f"  slot {slot}", LABEL_STYLE) if slot is not None else "",
         )
         self._heading(self.stderr, "WCO context")
@@ -366,6 +369,7 @@ class Output:
         no_wrap = not no_trunc
         table.expand = True
         table.add_column("", no_wrap=True, width=1)
+        table.add_column("ID", no_wrap=True)
         table.add_column(
             "NAME",
             style="cyan",
@@ -399,6 +403,7 @@ class Output:
             cells.append(
                 (
                     Text(self._glyph(kind), style=style),
+                    self._value(row.id, style="bold"),
                     Text(row.name),
                     self._status_lines(row.status, style),
                     self._worktree_cell(row.worktree, current_worktree),
@@ -425,6 +430,7 @@ class Output:
         table = self._table()
         table.expand = True
         table.add_column("", no_wrap=True, width=1)
+        table.add_column("ID", no_wrap=True)
         table.add_column("MODE", no_wrap=True)
         table.add_column("NAME", style="cyan", overflow="ellipsis", no_wrap=True, ratio=4, min_width=6)
         table.add_column("STATUS", overflow="fold", ratio=3, min_width=7)
@@ -443,6 +449,7 @@ class Output:
             cells.append(
                 (
                     Text(self._glyph(kind), style=style),
+                    self._value(row.id, style="bold"),
                     Text(row.mode, style="magenta" if row.mode == "isolated" else "cyan"),
                     Text(row.name),
                     self._status_lines(row.status, style),
