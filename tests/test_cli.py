@@ -86,6 +86,18 @@ def _allocate_port_worker(
         result_queue.put(("error", repr(exc), {}))
 
 
+def wide_terminal(fixture: "WorkspaceFixture"):
+    """A terminal wide enough that no column is ellipsized.
+
+    Temporary directories are far longer on some platforms than on others
+    (macOS resolves them under /private/var/folders/...), so a fixed COLUMNS
+    truncates the WORKTREE column there and not on Linux. Size it to the paths
+    the fixture actually produces instead.
+    """
+    width = len(str(fixture.workspace.resolve())) + 140
+    return patch.dict(os.environ, {"COLUMNS": str(width)})
+
+
 class WorkspaceFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -503,7 +515,7 @@ class PortOutputTests(unittest.TestCase):
 
         with (
             patch("wco.cli.default_port_store", return_value=self.store),
-            patch.dict(os.environ, {"COLUMNS": "200"}),
+            wide_terminal(self.fixture),
         ):
             result = run(
                 ["ports", "show", "--all"],
@@ -1506,7 +1518,7 @@ class PsOutputTests(unittest.TestCase):
         stderr = TerminalBuffer()
         commands: list[list[str]] = []
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps", "--all"],
                 cwd=self.fixture.main,
@@ -1552,7 +1564,7 @@ class PsOutputTests(unittest.TestCase):
         stderr = TerminalBuffer()
         other = self.fixture.create_repo("feature")
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,
@@ -1571,7 +1583,7 @@ class PsOutputTests(unittest.TestCase):
         stdout = TerminalBuffer()
         stderr = TerminalBuffer()
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["--isolated", "ps"],
                 cwd=self.fixture.main,
@@ -1594,7 +1606,7 @@ class PsOutputTests(unittest.TestCase):
         stderr = TerminalBuffer()
         commands: list[list[str]] = []
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,
@@ -1619,7 +1631,7 @@ class PsOutputTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "1a2b3c4\n", "")
             return self._fake_run(branch="HEAD")(command, **kwargs)
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,
@@ -1768,7 +1780,7 @@ class PsOutputTests(unittest.TestCase):
         commands: list[list[str]] = []
         feature = self.fixture.create_repo("feature")
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["stacks"],
                 cwd=self.fixture.main,
@@ -1807,7 +1819,7 @@ class PsOutputTests(unittest.TestCase):
         stdout = TerminalBuffer()
         feature = self.fixture.create_repo("feature")
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["stacks"],
                 cwd=self.fixture.main,
@@ -1832,7 +1844,7 @@ class PsOutputTests(unittest.TestCase):
     def test_ps_numbers_containers_within_the_current_stack(self) -> None:
         stdout = TerminalBuffer()
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,

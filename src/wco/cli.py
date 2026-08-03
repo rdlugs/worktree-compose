@@ -1360,7 +1360,10 @@ def _workspace_build_context_mappings(
         if not rendered_path.is_absolute() or rendered_path.exists():
             continue
         try:
-            relative = rendered_path.relative_to(invocation.worktree)
+            # resolve() first: the worktree is already resolved, so an
+            # unresolved context under a symlinked parent (/var on macOS, a
+            # short 8.3 path on Windows) would otherwise never match it.
+            relative = rendered_path.resolve().relative_to(invocation.worktree)
         except ValueError:
             continue
         workspace_path = invocation.config.workspace / relative
