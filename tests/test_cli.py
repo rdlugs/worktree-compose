@@ -13,6 +13,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from wco.cli import (
+    SHARED_STACK_ID,
+    STATE_VERSION,
+    Target,
     WcoError,
     PortStore,
     _isolated_name,
@@ -26,6 +29,7 @@ from wco.cli import (
     prepare_isolation_override,
     prepare_invocation,
     run,
+    split_target,
     state_file,
 )
 
@@ -80,6 +84,18 @@ def _allocate_port_worker(
         result_queue.put(("ok", slot, ports))
     except Exception as exc:
         result_queue.put(("error", repr(exc), {}))
+
+
+def wide_terminal(fixture: "WorkspaceFixture"):
+    """A terminal wide enough that no column is ellipsized.
+
+    Temporary directories are far longer on some platforms than on others
+    (macOS resolves them under /private/var/folders/...), so a fixed COLUMNS
+    truncates the WORKTREE column there and not on Linux. Size it to the paths
+    the fixture actually produces instead.
+    """
+    width = len(str(fixture.workspace.resolve())) + 140
+    return patch.dict(os.environ, {"COLUMNS": str(width)})
 
 
 class WorkspaceFixture:
@@ -499,7 +515,7 @@ class PortOutputTests(unittest.TestCase):
 
         with (
             patch("wco.cli.default_port_store", return_value=self.store),
-            patch.dict(os.environ, {"COLUMNS": "200"}),
+            wide_terminal(self.fixture),
         ):
             result = run(
                 ["ports", "show", "--all"],
@@ -1214,6 +1230,99 @@ class InvocationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertNotIn(".compose.yaml", " ".join(captured["args"]))
 
+    def test_shared_build_uses_context_from_central_workspace_when_missing_in_worktree(
+        self,
+    ) -> None:
+        central_context = self.fixture.workspace / "docker" / "nginx"
+        central_context.mkdir(parents=True)
+        (central_context / "Dockerfile").write_text("FROM scratch\n")
+        invocation = prepare_invocation(["build", "nginx"], False, self.fixture.main)
+
+        def fake_run(command: list[str], **_kwargs):
+            rendered_context = self.fixture.main / "docker" / "nginx"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "services": {
+                            "nginx": {
+                                "build": {"context": str(rendered_context)}
+                            }
+                        }
+                    }
+                ),
+                "",
+            )
+
+        override = prepare_isolation_override(
+            invocation,
+            fake_run,
+            self.fixture.root / "overrides",
+        )
+
+        self.assertIsNotNone(override)
+        assert override is not None
+        self.assertEqual(
+            override.build_contexts,
+            {"nginx": str(central_context.resolve())},
+        )
+        self.assertIn(
+            f'context: {json.dumps(str(central_context.resolve()))}',
+            override.path.read_text(),
+        )
+        command = build_invocation_command(invocation, override)
+        self.assertLess(command.index(str(override.path)), command.index("build"))
+
+    def test_shared_build_keeps_an_existing_worktree_context(self) -> None:
+        central_context = self.fixture.workspace / "docker" / "nginx"
+        worktree_context = self.fixture.main / "docker" / "nginx"
+        central_context.mkdir(parents=True)
+        worktree_context.mkdir(parents=True)
+        invocation = prepare_invocation(["build", "nginx"], False, self.fixture.main)
+
+        def fake_run(command: list[str], **_kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "services": {
+                            "nginx": {
+                                "build": {"context": str(worktree_context)}
+                            }
+                        }
+                    }
+                ),
+                "",
+            )
+
+        override = prepare_isolation_override(
+            invocation,
+            fake_run,
+            self.fixture.root / "overrides",
+        )
+
+        self.assertIsNone(override)
+
+    def test_shared_build_preserves_stdin_compose_passthrough(self) -> None:
+        invocation = prepare_invocation(
+            ["--file", "-", "build"],
+            False,
+            self.fixture.main,
+        )
+
+        def unexpected_run(*_args, **_kwargs):
+            raise AssertionError("stdin Compose input must remain untouched")
+
+        override = prepare_isolation_override(
+            invocation,
+            unexpected_run,
+            self.fixture.root / "overrides",
+        )
+
+        self.assertIsNone(override)
+
     def test_isolated_start_rejects_fixed_container_names(self) -> None:
         (self.fixture.main / ".env").write_text("APP_ENV=test\n")
         store = PortStore(self.fixture.root / "state" / "ports.json", lambda _port: True)
@@ -1409,7 +1518,7 @@ class PsOutputTests(unittest.TestCase):
         stderr = TerminalBuffer()
         commands: list[list[str]] = []
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps", "--all"],
                 cwd=self.fixture.main,
@@ -1455,7 +1564,7 @@ class PsOutputTests(unittest.TestCase):
         stderr = TerminalBuffer()
         other = self.fixture.create_repo("feature")
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,
@@ -1474,7 +1583,7 @@ class PsOutputTests(unittest.TestCase):
         stdout = TerminalBuffer()
         stderr = TerminalBuffer()
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["--isolated", "ps"],
                 cwd=self.fixture.main,
@@ -1497,7 +1606,7 @@ class PsOutputTests(unittest.TestCase):
         stderr = TerminalBuffer()
         commands: list[list[str]] = []
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,
@@ -1522,7 +1631,7 @@ class PsOutputTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "1a2b3c4\n", "")
             return self._fake_run(branch="HEAD")(command, **kwargs)
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["ps"],
                 cwd=self.fixture.main,
@@ -1671,7 +1780,7 @@ class PsOutputTests(unittest.TestCase):
         commands: list[list[str]] = []
         feature = self.fixture.create_repo("feature")
 
-        with patch.dict(os.environ, {"COLUMNS": "160"}):
+        with wide_terminal(self.fixture):
             result = run(
                 ["stacks"],
                 cwd=self.fixture.main,
@@ -1705,6 +1814,49 @@ class PsOutputTests(unittest.TestCase):
                 "{{.ID}}",
             ],
         )
+
+    def test_stacks_numbers_the_shared_stack_1_and_isolated_stacks_from_2(self) -> None:
+        stdout = TerminalBuffer()
+        feature = self.fixture.create_repo("feature")
+
+        with wide_terminal(self.fixture):
+            result = run(
+                ["stacks"],
+                cwd=self.fixture.main,
+                stdout=stdout,
+                stderr=TerminalBuffer(),
+                run_process=self._stacks_run(feature),
+                now_fn=lambda: self.now,
+            )
+
+        rendered = ANSI_ESCAPE.sub("", stdout.getvalue())
+        rows = [line for line in rendered.splitlines() if "example-" in line]
+        self.assertEqual(result, 0)
+        self.assertIn("ID", rendered)
+        self.assertIn("1.1", rows[0])
+        self.assertIn("2.1", rows[1])
+        # The ID is recorded, so it survives into the next listing.
+        self.assertEqual(
+            self.store.list_stack_ids(load_config(self.fixture.workspace / ".wco.toml")),
+            {feature.resolve(): 2},
+        )
+
+    def test_ps_numbers_containers_within_the_current_stack(self) -> None:
+        stdout = TerminalBuffer()
+
+        with wide_terminal(self.fixture):
+            result = run(
+                ["ps"],
+                cwd=self.fixture.main,
+                stdout=stdout,
+                stderr=TerminalBuffer(),
+                run_process=self._fake_run(),
+                now_fn=lambda: self.now,
+            )
+
+        rendered = ANSI_ESCAPE.sub("", stdout.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(self._column(rendered, "ID"), "1.1")
 
     def test_stacks_all_includes_stopped_containers(self) -> None:
         commands: list[list[str]] = []
@@ -1745,6 +1897,10 @@ class PsOutputTests(unittest.TestCase):
                 ("shared", str(self.fixture.main.resolve()), "master"),
                 ("isolated", str(feature.resolve()), "feature/login"),
             ],
+        )
+        self.assertEqual(
+            [(item["id"], item["stack_id"]) for item in payload["containers"]],
+            [("1.1", 1), ("2.1", 2)],
         )
 
     def test_stacks_reports_an_empty_workspace(self) -> None:
@@ -1908,6 +2064,296 @@ class PsOutputTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertNotRegex(stdout.getvalue(), r"\x1b\[(?:3[0-9]|9[0-7])m")
+
+
+class StackIdTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = WorkspaceFixture()
+        self.config = load_config(self.fixture.workspace / ".wco.toml")
+        self.store = PortStore(
+            self.fixture.root / "state" / "ports.json",
+            availability=lambda _port: True,
+        )
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def test_ids_start_after_the_shared_stack_and_are_stable(self) -> None:
+        feature = self.fixture.create_repo("feature")
+        first = self.store.stack_id(self.config, self.fixture.main)
+        second = self.store.stack_id(self.config, feature)
+
+        self.assertEqual(first, SHARED_STACK_ID + 1)
+        self.assertEqual(second, SHARED_STACK_ID + 2)
+        self.assertEqual(self.store.stack_id(self.config, self.fixture.main), first)
+        self.assertEqual(
+            self.store.worktree_for_stack_id(self.config, second), feature
+        )
+        self.assertIsNone(self.store.worktree_for_stack_id(self.config, 99))
+
+    def test_a_removed_worktree_frees_its_id_for_reuse(self) -> None:
+        feature = self.fixture.create_repo("feature")
+        self.store.stack_id(self.config, self.fixture.main)
+        self.assertEqual(self.store.stack_id(self.config, feature), 3)
+
+        subprocess.run(["rm", "-rf", str(feature)], check=True)
+        self.assertEqual(self.store.list_stack_ids(self.config), {self.fixture.main: 2})
+
+        other = self.fixture.create_repo("other")
+        self.assertEqual(self.store.stack_id(self.config, other), 3)
+
+    def test_ids_are_allocated_without_any_isolated_ports(self) -> None:
+        (self.fixture.workspace / ".wco.toml").write_text(
+            CONFIG.split("[isolation.ports]")[0]
+        )
+        config = load_config(self.fixture.workspace / ".wco.toml")
+        self.assertEqual(config.isolation.ports, {})
+
+        with patch("wco.cli.default_port_store", return_value=self.store):
+            invocation = prepare_invocation(["ps"], True, self.fixture.main)
+
+        self.assertEqual(invocation.stack_id, SHARED_STACK_ID + 1)
+        self.assertIsNone(invocation.slot)
+
+    def test_a_version_1_state_file_is_upgraded_without_losing_assignments(self) -> None:
+        slot, ports = 1, {"HTTP_PORT": 8100, "DEV_PORT": 5100}
+        self.store.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "assignments": [
+                        {
+                            "config": str(self.config.path),
+                            "worktree": str(self.fixture.main),
+                            "slot": slot,
+                            "ports": ports,
+                        }
+                    ],
+                }
+            )
+        )
+
+        identifier = self.store.stack_id(self.config, self.fixture.main)
+        data = json.loads(self.store.path.read_text())
+
+        self.assertEqual(data["version"], STATE_VERSION)
+        self.assertEqual(len(data["assignments"]), 1)
+        self.assertEqual(data["assignments"][0]["slot"], slot)
+        self.assertEqual(data["assignments"][0]["ports"], ports)
+        self.assertEqual(data["stacks"][0]["id"], identifier)
+
+    def test_an_unknown_state_version_is_still_rejected(self) -> None:
+        self.store.path.write_text(json.dumps({"version": 99, "assignments": []}))
+        with self.assertRaises(WcoError):
+            self.store.stack_id(self.config, self.fixture.main)
+
+
+class TargetParsingTests(unittest.TestCase):
+    def test_an_id_is_only_read_directly_after_the_compose_command(self) -> None:
+        self.assertEqual(split_target(["down", "2"]), (["down"], Target(2, None)))
+        self.assertEqual(
+            split_target(["restart", "2.1"]), (["restart"], Target(2, 1))
+        )
+        self.assertEqual(
+            split_target(["--profile", "x", "down", "3"]),
+            (["--profile", "x", "down"], Target(3, None)),
+        )
+
+    def test_numeric_arguments_elsewhere_are_passed_through(self) -> None:
+        for arguments in (
+            ["logs", "--tail", "20"],
+            ["logs", "-f", "2.1"],
+            ["up", "-d"],
+            ["down"],
+        ):
+            self.assertEqual(split_target(arguments), (list(arguments), None))
+
+    def test_zero_is_rejected_as_an_id(self) -> None:
+        for arguments in (["down", "0"], ["restart", "2.0"]):
+            with self.assertRaises(WcoError) as error:
+                split_target(arguments)
+            self.assertIn("IDs start at 1", str(error.exception))
+
+
+class TargetDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = WorkspaceFixture()
+        self.feature = self.fixture.create_repo("feature")
+        self.config = load_config(self.fixture.workspace / ".wco.toml")
+        self.store = PortStore(
+            self.fixture.root / "state" / "ports.json",
+            availability=lambda _port: True,
+        )
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+        for patcher in (
+            patch("wco.cli.default_port_store", return_value=self.store),
+            patch("wco.cli._validate_isolated_start"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # Startup commands such as 'restart' require this in the target worktree.
+        (self.feature / ".env").write_text("")
+        # Give the feature worktree stack ID 2.
+        self.stack_id = self.store.stack_id(self.config, self.feature.resolve())
+        self.project = _isolated_name("example", self.feature.resolve())
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def _capture(self, captured: dict[str, object]):
+        def capture(file: str, args: object, environment: object) -> None:
+            captured.update(file=file, args=args, environment=environment)
+
+        return capture
+
+    def _container_run(self, services: list[str]):
+        """Docker reports one container per service in the isolated project."""
+        containers = [
+            {
+                "Id": f"{index}" * 64,
+                "Name": f"/{self.project}-{service}-1",
+                "Config": {
+                    "Labels": {
+                        "com.docker.compose.project": self.project,
+                        "com.docker.compose.service": service,
+                        "com.docker.compose.container-number": "1",
+                    }
+                },
+                "State": {"Status": "running"},
+            }
+            for index, service in enumerate(services, start=1)
+        ]
+
+        def fake_run(command: list[str], **_kwargs):
+            if command[:2] == ["docker", "ps"]:
+                ids = "\n".join(str(item["Id"]) for item in containers)
+                return subprocess.CompletedProcess(command, 0, ids + "\n", "")
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(
+                    command, 0, json.dumps(containers), ""
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        return fake_run
+
+    def _run(self, argv: list[str], run_process=None, cwd: Path | None = None):
+        captured: dict[str, object] = {}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        result = run(
+            argv,
+            cwd=cwd or self.fixture.main,
+            stdout=stdout,
+            stderr=stderr,
+            exec_fn=self._capture(captured),
+            run_process=run_process
+            or (lambda command, **_k: subprocess.CompletedProcess(command, 0, "", "")),
+        )
+        return result, captured, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_stack_id_retargets_another_worktree(self) -> None:
+        result, captured, _stdout, stderr = self._run(["down", "2"])
+
+        command = list(captured["args"])
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            command[command.index("--project-name") + 1], self.project
+        )
+        self.assertEqual(
+            command[command.index("--project-directory") + 1],
+            str(self.feature.resolve()),
+        )
+        self.assertEqual(command[-1], "down")
+        self.assertIn("isolated", stderr)
+        self.assertIn("stack 2", ANSI_ESCAPE.sub("", stderr))
+
+    def test_isolated_flag_is_accepted_alongside_an_isolated_id(self) -> None:
+        _result, with_flag, _out, _err = self._run(["--isolated", "down", "2"])
+        _result, without_flag, _out, _err = self._run(["down", "2"])
+
+        self.assertEqual(list(with_flag["args"]), list(without_flag["args"]))
+
+    def test_stack_1_is_the_shared_stack_and_rejects_isolated(self) -> None:
+        result, captured, _stdout, _stderr = self._run(["down", "1"])
+        command = list(captured["args"])
+        self.assertEqual(result, 0)
+        self.assertEqual(command[command.index("--project-name") + 1], "example")
+
+        result, _captured, _stdout, stderr = self._run(["--isolated", "down", "1"])
+        self.assertEqual(result, 1)
+        self.assertIn("shared stack", stderr)
+
+    def test_a_container_id_resolves_to_its_service_name(self) -> None:
+        result, captured, _stdout, _stderr = self._run(
+            ["restart", "2.2"], run_process=self._container_run(["db", "web"])
+        )
+
+        command = list(captured["args"])
+        self.assertEqual(result, 0)
+        self.assertEqual(command[-2:], ["restart", "web"])
+        self.assertEqual(
+            command[command.index("--project-name") + 1], self.project
+        )
+
+    def test_a_container_id_precedes_the_command_arguments_for_exec(self) -> None:
+        result, captured, _stdout, _stderr = self._run(
+            ["exec", "2.1", "sh"], run_process=self._container_run(["db", "web"])
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(list(captured["args"])[-3:], ["exec", "db", "sh"])
+
+    def test_down_rejects_a_container_id(self) -> None:
+        result, _captured, _stdout, stderr = self._run(["down", "2.1"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("targets a whole stack", stderr)
+        self.assertIn("wco stop 2.1", stderr)
+
+    def test_an_out_of_range_container_id_is_rejected(self) -> None:
+        result, _captured, _stdout, stderr = self._run(
+            ["restart", "2.9"], run_process=self._container_run(["db", "web"])
+        )
+
+        self.assertEqual(result, 1)
+        self.assertIn("out of range", stderr)
+        self.assertIn("2.1-2.2", stderr)
+
+    def test_an_unknown_stack_id_names_wco_stacks(self) -> None:
+        result, _captured, _stdout, stderr = self._run(["down", "7"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("No stack has ID 7", stderr)
+        self.assertIn("wco stacks", stderr)
+
+    def test_a_stack_id_whose_worktree_is_gone_is_reported(self) -> None:
+        data = json.loads(self.store.path.read_text())
+        data["stacks"][0]["worktree"] = str(self.fixture.workspace / "vanished")
+        self.store.path.write_text(json.dumps(data))
+
+        result, _captured, _stdout, stderr = self._run(["down", "2"])
+
+        self.assertEqual(result, 1)
+        # _prune drops the entry before lookup, so the ID reads as unknown.
+        self.assertIn("No stack has ID 2", stderr)
+
+    def test_down_all_is_unaffected_by_target_parsing(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        result = run(
+            ["--isolated", "down", "--all"],
+            cwd=self.fixture.main,
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            run_process=fake_run,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(any(command[-1] == "down" for command in commands))
 
 
 if __name__ == "__main__":

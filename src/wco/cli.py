@@ -25,10 +25,14 @@ from .presentation import Output, PortRow, PsRow, StackRow
 CONFIG_NAME = ".wco.toml"
 LEGACY_CONFIG_NAME = ".bcompose.toml"
 LEGACY_STATE_DIRECTORY = "bcompose"
+STATE_VERSION = 2
+SHARED_STACK_ID = 1
+TARGET_RE = re.compile(r"^(\d+)(?:\.(\d+))?$")
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 STARTUP_COMMANDS = ("up", "create", "start", "restart", "run", "watch")
+BUILD_CONTEXT_COMMANDS = {"build", "up", "create", "run", "watch"}
 COMPOSE_COMMANDS = {
     "attach",
     "build",
@@ -140,9 +144,21 @@ class Invocation:
     compose_command: str | None
     project_name: str
     instance_name: str
+    stack_id: int
     slot: int | None
     ports: dict[str, int]
     environment: dict[str, str]
+
+
+@dataclass(frozen=True)
+class Target:
+    """A wco ID naming a stack, and optionally one container inside it."""
+
+    stack: int
+    container: int | None
+
+    def __str__(self) -> str:
+        return f"{self.stack}" if self.container is None else f"{self.stack}.{self.container}"
 
 
 @dataclass(frozen=True)
@@ -151,6 +167,7 @@ class IsolationOverride:
     names: dict[str, str]
     ports: dict[str, tuple[dict[str, object], ...]]
     rewritten_ports: int
+    build_contexts: dict[str, str]
 
 
 def _table(data: Mapping[str, object], name: str) -> Mapping[str, object]:
@@ -394,6 +411,43 @@ def compose_command(arguments: Sequence[str]) -> str | None:
     return arguments[index] if index is not None else None
 
 
+def split_target(arguments: Sequence[str]) -> tuple[list[str], Target | None]:
+    """Strip a '<stack>[.<container>]' wco ID from just after the Compose command.
+
+    Only that one position is examined, so numeric option values and service
+    names elsewhere are passed through untouched.
+    """
+    command_index = _compose_command_index(arguments)
+    if command_index is None:
+        return list(arguments), None
+    position = command_index + 1
+    if position >= len(arguments):
+        return list(arguments), None
+    token = arguments[position]
+    match = TARGET_RE.match(token)
+    if match is None:
+        return list(arguments), None
+    stack = int(match.group(1))
+    container = None if match.group(2) is None else int(match.group(2))
+    if stack < 1 or container == 0:
+        raise WcoError(f"'{token}' is not a valid wco ID; IDs start at 1.")
+    remaining = [*arguments[:position], *arguments[position + 1 :]]
+    return remaining, Target(stack=stack, container=container)
+
+
+def _insert_after_command(arguments: Sequence[str], extra: Sequence[str]) -> list[str]:
+    if not extra:
+        return list(arguments)
+    command_index = _compose_command_index(arguments)
+    if command_index is None:
+        raise WcoError("Cannot locate the Docker Compose command.")
+    return [
+        *arguments[: command_index + 1],
+        *extra,
+        *arguments[command_index + 1 :],
+    ]
+
+
 def reject_reserved_arguments(arguments: Sequence[str]) -> None:
     for index, argument in enumerate(arguments):
         if argument in RESERVED_PROJECT_OPTIONS:
@@ -630,16 +684,22 @@ class PortStore:
 
     def _read(self) -> dict[str, object]:
         if not self.path.exists():
-            return {"version": 1, "assignments": []}
+            return {"version": STATE_VERSION, "assignments": [], "stacks": []}
         try:
             data = json.loads(self.path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise WcoError(f"Cannot read port state '{self.path}': {exc}") from exc
         if (
             not isinstance(data, dict)
-            or data.get("version") != 1
+            or data.get("version") not in {1, STATE_VERSION}
             or not isinstance(data.get("assignments"), list)
         ):
+            raise WcoError(f"Port state '{self.path}' has an unsupported format.")
+        if data.get("version") == 1:
+            # Version 1 predates stack IDs; the rest of the file is unchanged.
+            data["version"] = STATE_VERSION
+            data["stacks"] = []
+        elif not isinstance(data.get("stacks"), list):
             raise WcoError(f"Port state '{self.path}' has an unsupported format.")
         return data
 
@@ -664,36 +724,41 @@ class PortStore:
 
     @staticmethod
     def _upgrade_config_paths(data: dict[str, object]) -> bool:
-        assignments = data["assignments"]
-        assert isinstance(assignments, list)
         changed = False
-        for item in assignments:
-            if not isinstance(item, dict) or not isinstance(item.get("config"), str):
-                continue
-            config_path = Path(item["config"])
-            if config_path.name != LEGACY_CONFIG_NAME:
-                continue
-            replacement = config_path.with_name(CONFIG_NAME)
-            if replacement.is_file():
-                item["config"] = str(replacement.resolve())
-                changed = True
+        for key in ("assignments", "stacks"):
+            entries = data[key]
+            assert isinstance(entries, list)
+            for item in entries:
+                if not isinstance(item, dict) or not isinstance(item.get("config"), str):
+                    continue
+                config_path = Path(item["config"])
+                if config_path.name != LEGACY_CONFIG_NAME:
+                    continue
+                replacement = config_path.with_name(CONFIG_NAME)
+                if replacement.is_file():
+                    item["config"] = str(replacement.resolve())
+                    changed = True
         return changed
 
     @staticmethod
-    def _prune(data: dict[str, object]) -> bool:
-        assignments = data["assignments"]
-        assert isinstance(assignments, list)
-        kept = [
-            item
-            for item in assignments
-            if isinstance(item, dict)
+    def _live(item: object) -> bool:
+        return (
+            isinstance(item, dict)
             and isinstance(item.get("config"), str)
             and isinstance(item.get("worktree"), str)
             and Path(item["config"]).is_file()
             and Path(item["worktree"]).is_dir()
-        ]
-        changed = len(kept) != len(assignments)
-        data["assignments"] = kept
+        )
+
+    @classmethod
+    def _prune(cls, data: dict[str, object]) -> bool:
+        changed = False
+        for key in ("assignments", "stacks"):
+            entries = data[key]
+            assert isinstance(entries, list)
+            kept = [item for item in entries if cls._live(item)]
+            changed = changed or len(kept) != len(entries)
+            data[key] = kept
         return changed
 
     @staticmethod
@@ -882,6 +947,75 @@ class PortStore:
                 str(name): int(value)
                 for name, value in dict(assignment["ports"]).items()
             }
+
+    @staticmethod
+    def _stack_entries(
+        data: Mapping[str, object], config: WorkspaceConfig
+    ) -> list[dict[str, object]]:
+        stacks = data["stacks"]
+        assert isinstance(stacks, list)
+        return [
+            item
+            for item in stacks
+            if isinstance(item, dict)
+            and item.get("config") == str(config.path)
+            and isinstance(item.get("id"), int)
+        ]
+
+    def stack_id(self, config: WorkspaceConfig, worktree: Path) -> int:
+        """The persistent integer ID of this worktree's isolated stack.
+
+        IDs start at SHARED_STACK_ID + 1: the shared project is always ID 1 and
+        is never recorded. The lowest free ID is reused once _prune drops a
+        worktree that no longer exists.
+        """
+        with self._locked():
+            data = self._read()
+            changed = self._upgrade_config_paths(data)
+            changed = self._prune(data) or changed
+            entries = self._stack_entries(data, config)
+            for item in entries:
+                if item.get("worktree") == str(worktree):
+                    if changed:
+                        self._write(data)
+                    return int(item["id"])
+            taken = {int(item["id"]) for item in entries}
+            identifier = SHARED_STACK_ID + 1
+            while identifier in taken:
+                identifier += 1
+            stacks = data["stacks"]
+            assert isinstance(stacks, list)
+            stacks.append(
+                {
+                    "config": str(config.path),
+                    "worktree": str(worktree),
+                    "id": identifier,
+                }
+            )
+            self._write(data)
+            return identifier
+
+    def list_stack_ids(self, config: WorkspaceConfig) -> dict[Path, int]:
+        """Every recorded stack ID for this workspace, as stored."""
+        with self._locked():
+            data = self._read()
+            changed = self._upgrade_config_paths(data)
+            changed = self._prune(data) or changed
+            listed = {
+                Path(str(item["worktree"])): int(item["id"])
+                for item in self._stack_entries(data, config)
+            }
+            if changed:
+                self._write(data)
+            return listed
+
+    def worktree_for_stack_id(
+        self, config: WorkspaceConfig, stack_id: int
+    ) -> Path | None:
+        for worktree, identifier in self.list_stack_ids(config).items():
+            if identifier == stack_id:
+                return worktree
+        return None
 
 
 def migrate_legacy_state(environ: Mapping[str, str] | None = None) -> Path:
@@ -1084,9 +1218,15 @@ def _port_mappings(
 
 def _write_isolation_override(path: Path, override: IsolationOverride) -> None:
     content = ["services:"]
-    services = sorted(set(override.names) | set(override.ports))
+    services = sorted(
+        set(override.names) | set(override.ports) | set(override.build_contexts)
+    )
     for service in services:
         content.append(f"  {json.dumps(service)}:")
+        build_context = override.build_contexts.get(service)
+        if build_context is not None:
+            content.append("    build:")
+            content.append(f"      context: {json.dumps(build_context)}")
         container_name = override.names.get(service)
         if container_name is not None:
             content.append(f"    container_name: {json.dumps(container_name)}")
@@ -1182,11 +1322,54 @@ def _render_compose_config(
         rendered = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise WcoError(
-            f"Docker Compose returned invalid JSON during isolation preparation: {exc}"
+            f"Docker Compose returned invalid JSON while preparing overrides: {exc}"
         ) from exc
     if not isinstance(rendered, dict):
         raise WcoError("Docker Compose returned an invalid configuration model.")
     return rendered
+
+
+def _workspace_build_context_mappings(
+    invocation: Invocation,
+    rendered: Mapping[str, object],
+) -> dict[str, str]:
+    """Find relative build contexts that only exist in the central workspace.
+
+    Compose resolves every relative path from the project directory. WCO uses the
+    active worktree as that directory so relative bind mounts keep targeting the
+    selected checkout. Central Docker build assets are the exception: when the
+    worktree-relative context is absent but the same path exists beside the WCO
+    configuration, override just that context with its absolute workspace path.
+    """
+    if invocation.worktree == invocation.config.workspace:
+        return {}
+    services = rendered.get("services", {})
+    if not isinstance(services, dict):
+        return {}
+    mappings: dict[str, str] = {}
+    for service, definition in services.items():
+        if not isinstance(service, str) or not isinstance(definition, dict):
+            continue
+        build = definition.get("build")
+        if not isinstance(build, dict):
+            continue
+        context = build.get("context")
+        if not isinstance(context, str):
+            continue
+        rendered_path = Path(context)
+        if not rendered_path.is_absolute() or rendered_path.exists():
+            continue
+        try:
+            # resolve() first: the worktree is already resolved, so an
+            # unresolved context under a symlinked parent (/var on macOS, a
+            # short 8.3 path on Windows) would otherwise never match it.
+            relative = rendered_path.resolve().relative_to(invocation.worktree)
+        except ValueError:
+            continue
+        workspace_path = invocation.config.workspace / relative
+        if workspace_path.exists():
+            mappings[service] = str(workspace_path.resolve())
+    return mappings
 
 
 def prepare_isolation_override(
@@ -1194,19 +1377,20 @@ def prepare_isolation_override(
     run_process: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     directory: Path | None = None,
 ) -> IsolationOverride | None:
-    if (
-        not invocation.isolated
-        or not (
-            invocation.config.isolation.rewrite_container_names
-            or invocation.config.isolation.rewrite_ports
-        )
-    ):
+    rewrites_isolation = invocation.isolated and (
+        invocation.config.isolation.rewrite_container_names
+        or invocation.config.isolation.rewrite_ports
+    )
+    checks_build_contexts = invocation.compose_command in BUILD_CONTEXT_COMMANDS
+    if not rewrites_isolation and not checks_build_contexts:
         return None
     run_process = run_process or subprocess.run
     global_arguments = _compose_global_arguments(invocation.compose_args)
     if _uses_stdin_compose_file(global_arguments):
+        if not rewrites_isolation:
+            return None
         raise WcoError(
-            "Isolation rewriting cannot be used with '--file -'. "
+            "Generated overrides cannot be used with '--file -'. "
             "Use a named Compose file instead."
         )
     rendered = _render_compose_config(
@@ -1215,19 +1399,27 @@ def prepare_isolation_override(
         run_process,
         all_profiles=True,
     )
+    build_contexts = _workspace_build_context_mappings(invocation, rendered)
     names = (
         _container_name_mappings(invocation, rendered)
-        if invocation.config.isolation.rewrite_container_names
+        if invocation.isolated
+        and invocation.config.isolation.rewrite_container_names
         else {}
     )
-    ports, rewritten_ports = _port_mappings(invocation, rendered)
-    if not names and not ports:
+    ports, rewritten_ports = (
+        _port_mappings(invocation, rendered)
+        if invocation.isolated and invocation.config.isolation.rewrite_ports
+        else ({}, 0)
+    )
+    if not names and not ports and not build_contexts:
         return None
     path = _container_override_path(
         invocation,
         (directory or override_directory()).resolve(),
     )
-    override = IsolationOverride(path, names, ports, rewritten_ports)
+    override = IsolationOverride(
+        path, names, ports, rewritten_ports, build_contexts
+    )
     _write_isolation_override(path, override)
     return override
 
@@ -1254,9 +1446,12 @@ def _render_environment(
     return environment
 
 
-def _docker_container_ids(project_name: str) -> list[str]:
+def _docker_container_ids(
+    project_name: str,
+    run_process: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[str]:
     try:
-        result = subprocess.run(
+        result = run_process(
             [
                 "docker",
                 "ps",
@@ -1397,14 +1592,18 @@ def prepare_invocation(
     if isolated:
         project_name = _isolated_name(config.project_name, worktree)
         instance_name = _isolated_name(config.instance_name, worktree)
+        # Stack IDs are allocated for every isolated worktree, whether or not
+        # the workspace declares isolated ports.
+        store = store or default_port_store()
+        stack_id = store.stack_id(config, worktree)
         if config.isolation.ports:
-            store = store or default_port_store()
             slot, ports = store.get_or_allocate(config, worktree)
         else:
             slot, ports = None, {}
     else:
         project_name = config.project_name
         instance_name = config.instance_name
+        stack_id = SHARED_STACK_ID
         slot = None
         ports = dict(config.isolation.ports)
 
@@ -1419,6 +1618,7 @@ def prepare_invocation(
         compose_command=command,
         project_name=project_name,
         instance_name=instance_name,
+        stack_id=stack_id,
         slot=slot,
         ports=ports,
         environment=environment,
@@ -1722,6 +1922,99 @@ def _container_label(inspection: Mapping[str, object], label: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _container_number(inspection: Mapping[str, object]) -> int:
+    try:
+        return int(_container_label(inspection, "com.docker.compose.container-number"))
+    except ValueError:
+        return 0
+
+
+def _container_sort_key(service: str, number: int, name: str) -> tuple[str, int, str]:
+    """The ordering that assigns container sub-IDs, used for listing and lookup."""
+    return (service, number, name)
+
+
+def _stack_containers(
+    project_name: str,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+    output: Output,
+) -> list[str]:
+    """Service names in one Compose project, in container sub-ID order."""
+    ids = _docker_container_ids(project_name, run_process)
+    inspections = _inspect_containers(ids, run_process, output)
+    entries: list[tuple[tuple[str, int, str], str]] = []
+    for container_id in ids:
+        inspection = inspections.get(container_id)
+        if inspection is None:
+            continue
+        service = _container_label(inspection, "com.docker.compose.service")
+        name = str(inspection.get("Name") or container_id[:12]).lstrip("/")
+        entries.append(
+            (_container_sort_key(service, _container_number(inspection), name), service)
+        )
+    entries.sort(key=lambda entry: entry[0])
+    return [service for _key, service in entries]
+
+
+def _resolve_target(
+    target: Target,
+    command: str | None,
+    isolated: bool,
+    cwd: Path | None,
+    output: Output,
+    run_process: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[Path, bool, list[str]]:
+    """Map a wco ID to the worktree, mode, and extra Compose arguments it names."""
+    worktree = resolve_worktree((cwd or Path.cwd()).resolve())
+    config = load_config(find_config(worktree))
+
+    if target.stack == SHARED_STACK_ID:
+        if isolated:
+            raise WcoError(
+                f"Stack {SHARED_STACK_ID} is this workspace's shared stack; "
+                "drop '--isolated'."
+            )
+        target_worktree, target_isolated = worktree, False
+        project_name = config.project_name
+    else:
+        found = default_port_store().worktree_for_stack_id(config, target.stack)
+        if found is None:
+            raise WcoError(
+                f"No stack has ID {target.stack} in this workspace. "
+                "Run 'wco stacks' to list them."
+            )
+        if not found.is_dir():
+            raise WcoError(
+                f"Stack {target.stack} refers to '{found}', which no longer exists. "
+                "Remove its containers with 'docker compose -p "
+                f"{_isolated_name(config.project_name, found)} down'."
+            )
+        target_worktree, target_isolated = found, True
+        project_name = _isolated_name(config.project_name, found)
+
+    if target.container is None:
+        return target_worktree, target_isolated, []
+
+    if command == "down":
+        raise WcoError(
+            f"'down' targets a whole stack. Use 'wco stop {target}' to stop one "
+            f"container, or 'wco down {target.stack}' to bring the stack down."
+        )
+    services = _stack_containers(project_name, run_process, output)
+    if not services:
+        raise WcoError(
+            f"Stack {target.stack} has no containers, so '{target}' cannot be "
+            "resolved. Start it with 'wco up -d' first."
+        )
+    if target.container > len(services):
+        raise WcoError(
+            f"Stack {target.stack} has {len(services)} container(s); "
+            f"'{target}' is out of range (valid: {target.stack}.1-"
+            f"{target.stack}.{len(services)})."
+        )
+    return target_worktree, target_isolated, [services[target.container - 1]]
+
+
 def _stack_mode(config: WorkspaceConfig, project: str, worktree: str) -> str | None:
     if project == config.project_name:
         return "shared"
@@ -1738,8 +2031,10 @@ def _stack_rows(
     ids: Sequence[str],
     now: datetime,
     run_process: Callable[..., subprocess.CompletedProcess[str]],
+    stack_ids: Mapping[str, int] | None = None,
 ) -> list[StackRow]:
-    rows: list[StackRow] = []
+    stack_ids = {} if stack_ids is None else stack_ids
+    ordered: list[tuple[tuple[int, str, int, str], StackRow]] = []
     branches: dict[str, str] = {}
     for container_id in ids:
         inspection = inspections.get(container_id)
@@ -1754,20 +2049,68 @@ def _stack_rows(
         name = str(inspection.get("Name") or container_id[:12] or "-").lstrip("/")
         if worktree not in branches:
             branches[worktree] = _worktree_branch(worktree, run_process)
-        rows.append(
-            StackRow(
-                name=name,
-                status=status,
-                state=state,
-                health=health,
-                worktree=worktree,
-                branch=branches[worktree],
-                mode=mode,
-                project=project,
+        stack_id = (
+            SHARED_STACK_ID if mode == "shared" else stack_ids.get(worktree, 0)
+        )
+        service = _container_label(inspection, "com.docker.compose.service")
+        ordered.append(
+            (
+                (stack_id, *_container_sort_key(
+                    service, _container_number(inspection), name
+                )),
+                StackRow(
+                    name=name,
+                    status=status,
+                    state=state,
+                    health=health,
+                    worktree=worktree,
+                    branch=branches[worktree],
+                    mode=mode,
+                    project=project,
+                    id=str(stack_id),
+                ),
             )
         )
-    rows.sort(key=lambda row: (row.mode != "shared", row.worktree, row.name))
+    ordered.sort(key=lambda entry: entry[0])
+
+    # Sub-IDs are per stack, numbered in the order the rows are displayed.
+    rows: list[StackRow] = []
+    position = 0
+    previous: str | None = None
+    for _key, row in ordered:
+        position = position + 1 if row.id == previous else 1
+        previous = row.id
+        rows.append(replace(row, id="-" if row.id == "0" else f"{row.id}.{position}"))
     return rows
+
+
+def _assign_stack_ids(
+    config: WorkspaceConfig,
+    inspections: Mapping[str, Mapping[str, object]],
+    ids: Sequence[str],
+) -> dict[str, int]:
+    """Stack IDs keyed by worktree, allocating one for each isolated stack seen.
+
+    'wco stacks' is where users learn an ID, so a stack that is running but has
+    never been through prepare_invocation still gets one here.
+    """
+    store = default_port_store()
+    assigned = {
+        str(worktree): identifier
+        for worktree, identifier in store.list_stack_ids(config).items()
+    }
+    for container_id in ids:
+        inspection = inspections.get(container_id)
+        if inspection is None:
+            continue
+        worktree = _container_worktree(inspection)
+        project = _container_label(inspection, "com.docker.compose.project")
+        if _stack_mode(config, project, worktree) != "isolated":
+            continue
+        if worktree in assigned or not Path(worktree).is_dir():
+            continue
+        assigned[worktree] = store.stack_id(config, Path(worktree))
+    return assigned
 
 
 def _is_down_all(arguments: Sequence[str]) -> bool:
@@ -1783,10 +2126,12 @@ def _isolated_worktrees(
     run_process: Callable[..., subprocess.CompletedProcess[str]],
     output: Output,
 ) -> list[Path]:
-    """Every worktree with an isolated slot or an isolated container."""
-    worktrees: list[Path] = [
-        worktree for worktree, _slot, _ports in default_port_store().list_assignments(config)
-    ]
+    """Every worktree with a stack ID, an isolated slot, or an isolated container."""
+    store = default_port_store()
+    worktrees: list[Path] = list(store.list_stack_ids(config))
+    for worktree, _slot, _ports in store.list_assignments(config):
+        if worktree not in worktrees:
+            worktrees.append(worktree)
     ids = _compose_container_ids(run_process, include_stopped=True)
     inspections = _inspect_containers(ids, run_process, output)
     for container_id in ids:
@@ -1861,7 +2206,8 @@ def _stacks_command(
     config = load_config(find_config(worktree))
     ids = _compose_container_ids(run_process, include_stopped=include_stopped)
     inspections = _inspect_containers(ids, run_process, output)
-    rows = _stack_rows(config, inspections, ids, now, run_process)
+    stack_ids = _assign_stack_ids(config, inspections, ids)
+    rows = _stack_rows(config, inspections, ids, now, run_process, stack_ids)
     if output_format == "json":
         _write_json(
             stdout,
@@ -1870,6 +2216,8 @@ def _stacks_command(
                 "project": config.project_name,
                 "containers": [
                     {
+                        "id": None if row.id == "-" else row.id,
+                        "stack_id": None if row.id == "-" else int(row.id.split(".")[0]),
                         "mode": row.mode,
                         "project": row.project,
                         "name": row.name,
@@ -2078,22 +2426,32 @@ def _ps_rows(
     items: Sequence[Mapping[str, object]],
     inspections: Mapping[str, Mapping[str, object]],
     now: datetime,
+    stack_id: int | None = None,
 ) -> list[PsRow]:
-    rows: list[PsRow] = []
+    ordered: list[tuple[tuple[str, int, str], PsRow]] = []
     for item in items:
         container_id = str(item.get("ID") or "")
         inspection = inspections.get(container_id, {})
         status, state, health = _container_status(item, inspection, now)
-        rows.append(
-            PsRow(
-                name=str(item.get("Name") or container_id[:12] or "-"),
-                status=status,
-                state=state,
-                health=health,
-                worktree=_container_worktree(inspection),
-            )
+        name = str(item.get("Name") or container_id[:12] or "-")
+        service = str(item.get("Service") or "") or _container_label(
+            inspection, "com.docker.compose.service"
         )
-    return rows
+        row = PsRow(
+            name=name,
+            status=status,
+            state=state,
+            health=health,
+            worktree=_container_worktree(inspection),
+        )
+        ordered.append(
+            (_container_sort_key(service, _container_number(inspection), name), row)
+        )
+    ordered.sort(key=lambda entry: entry[0])
+    return [
+        replace(row, id="-" if stack_id is None else f"{stack_id}.{position}")
+        for position, (_key, row) in enumerate(ordered, start=1)
+    ]
 
 
 def _inspect_containers(
@@ -2145,6 +2503,7 @@ def _print_context(
         invocation.slot,
         len(override.names) if override is not None else 0,
         override.rewritten_ports if override is not None else 0,
+        stack_id=invocation.stack_id,
         current_worktree=invocation.worktree,
     )
 
@@ -2184,7 +2543,7 @@ def _run_pretty_ps(
     items = _parse_ps_json(result.stdout)
     ids = [str(item.get("ID")) for item in items if item.get("ID")]
     inspections = _inspect_containers(ids, run_process, output)
-    rows = _ps_rows(items, inspections, now)
+    rows = _ps_rows(items, inspections, now, invocation.stack_id)
     branches = _worktree_branches(rows, run_process)
     rows = [replace(row, branch=branches[row.worktree]) for row in rows]
     _print_context(output, invocation, override, None)
@@ -2216,6 +2575,11 @@ STACKS_HELP = """Usage: wco stacks [-a|--all] [--format table|json]
 List every container this workspace owns, in the shared project and in each
 worktree's isolated project, with the worktree and branch it runs from.
 
+The ID column shows each container's '<stack>.<container>' address. Stack 1 is
+always the shared project; isolated worktrees are numbered from 2 and keep
+their ID until the worktree is removed. Pass an ID to a Compose command to
+target that stack or container, e.g. 'wco down 2' or 'wco restart 2.1'.
+
 Options:
   -a, --all        Include stopped containers.
   --format FORMAT  Select table or JSON output.
@@ -2223,7 +2587,7 @@ Options:
 """
 
 
-HELP = """Usage: wco [--isolated] <docker compose arguments>
+HELP = """Usage: wco [--isolated] <command> [ID] [docker compose arguments]
        wco init [--compose PATH] [--project NAME] [--force]
        wco ports <show|reallocate> [--all] [--format table|json]
        wco stacks [--all] [--format table|json]
@@ -2231,6 +2595,12 @@ HELP = """Usage: wco [--isolated] <docker compose arguments>
 Run a workspace's central Docker Compose configuration against the current
 Git worktree. The nearest .wco.toml at or above the worktree defines the
 Compose files, environment, validation rules, and isolated ports.
+
+An optional ID directly after the Compose command targets another stack
+without changing directory. 'wco stacks' lists the IDs: stack 1 is the shared
+project, isolated worktrees are numbered from 2, and '2.1' addresses a single
+container inside stack 2. Because only that one position is read as an ID,
+put it before any flags: 'wco logs 2.1 -f', not 'wco logs -f 2.1'.
 
 Options:
   --isolated   Use a worktree-specific project name and persistent port slot.
@@ -2247,6 +2617,9 @@ Examples:
   wco --isolated up -d
   wco --isolated down
   wco --isolated down --all
+  wco down 2
+  wco restart 2.1
+  wco logs 2.1 -f
   wco ports show
   wco ports show --all
   wco stacks --all
@@ -2297,6 +2670,19 @@ def run(
             raise WcoError("Docker Compose arguments are required.")
         if isolated and _is_down_all(arguments):
             return _isolated_down_all(arguments, cwd, output, run_process)
+
+        arguments, target = split_target(arguments)
+        if target is not None:
+            worktree, isolated, extra = _resolve_target(
+                target,
+                compose_command(arguments),
+                isolated,
+                cwd,
+                output,
+                run_process,
+            )
+            cwd = worktree
+            arguments = _insert_after_command(arguments, extra)
 
         invocation = prepare_invocation(arguments, isolated, cwd)
         override = prepare_isolation_override(invocation, run_process)

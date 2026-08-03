@@ -90,6 +90,9 @@ Things worth knowing:
 - Initialization never changes the Compose file.
 - Relative Compose paths such as `./` resolve from the **active worktree**, and Docker Compose
   loads `.env` from that worktree for interpolation.
+- If a relative build context is absent from the active worktree but the same path exists beside
+  `.wco.toml`, WCO uses that central workspace path. This supports shared Dockerfiles such as
+  `build: { context: ./docker/nginx }` without changing worktree-relative bind mounts.
 - Declare parameterized published ports under `[isolation.ports]`.
 - Existing `.wco.toml` files are not replaced unless `--force` is supplied.
 
@@ -105,7 +108,7 @@ wco down
 ```
 
 **Output.** Interactive commands use colored, terminal-aware output. `wco ps` presents a
-responsive `NAME`, `STATUS`, `WORKTREE`, and `BRANCH` table with status highlighting, and
+responsive `ID`, `NAME`, `STATUS`, `WORKTREE`, and `BRANCH` table with status highlighting, and
 supports Compose filters, service arguments, `--all`, `--status`, `--orphans`, and `--no-trunc`.
 When output is redirected — or when `--format`, `--quiet`, or `--services` is supplied — WCO
 delegates the output to Docker Compose unchanged. Set [`NO_COLOR`](https://no-color.org/) to
@@ -127,6 +130,26 @@ wco stacks --format json
 `wco stacks` scans Docker for Compose containers and keeps the ones whose project is this
 workspace's shared project or the isolated project derived from their recorded worktree, so
 stacks belonging to other projects are never listed.
+
+**Targeting a stack by ID.** Every row carries an `ID` of the form `<stack>.<container>`. Stack 1
+is always the shared project; isolated worktrees are numbered from 2 and keep their ID until the
+worktree is removed, so an ID is safe to script against. Pass one directly after a Compose command
+to act on that stack — or that single container — without changing directory:
+
+```bash
+wco down 2          # bring down stack 2, wherever you are
+wco restart 2.1     # restart just that container's service
+wco logs 2.1 -f     # ...the ID comes first, then the flags
+wco exec 2.1 sh
+```
+
+A container ID resolves to its Compose service name, so it works with any command that accepts
+services. `down` acts on whole stacks and rejects a container ID — use `stop` for one container.
+The ID is only read in the position immediately after the Compose command, which keeps numeric
+option values such as `wco logs --tail 20` untouched; the same rule means a service literally
+named `2` cannot be targeted this way. Stack IDs are recorded alongside port slots in `ports.json`
+(see [Port assignments and state](#port-assignments-and-state)) and are reused once the worktree
+they name is gone.
 
 **Where containers run.** The `WORKTREE` column reports the worktree each listed container was
 actually created from — not the one you are standing in — and is highlighted when the two differ.
@@ -311,7 +334,8 @@ needed and remain available for later commands such as `wco --isolated down`.
 ### Port assignments and state
 
 The first isolated worktree receives each base port plus one `port_step`, the next receives the
-lowest available slot, and assignments remain stable in `ports.json`:
+lowest available slot, and assignments remain stable in `ports.json`. The same file records each
+worktree's stack ID, so both survive across invocations:
 
 | Platform | State file |
 | --- | --- |
@@ -319,7 +343,9 @@ lowest available slot, and assignments remain stable in `ports.json`:
 | Native Windows | `%LOCALAPPDATA%\wco\ports.json` |
 
 Generated isolation overrides for container names and fixed ports use the adjacent `overrides/`
-directory.
+directory. Entries whose config file or worktree no longer exists are pruned on read, which frees
+both the port slot and the stack ID for reuse. WCO upgrades an older `ports.json` in place the
+first time it writes to it.
 
 > [!NOTE]
 > `wco` controls Docker Compose's project name, so `-p` and `--project-name` are intentionally

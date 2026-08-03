@@ -7,6 +7,29 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add persistent integer stack IDs and `<stack>.<container>` container IDs, shown
+  in a new `ID` column in `wco ps` and `wco stacks` and in their JSON output. Stack
+  1 is always the shared project; isolated worktrees are numbered from 2 and keep
+  their ID, recorded in `ports.json`, until the worktree is removed.
+- Accept an ID directly after a Docker Compose command to target another stack, or
+  a single container inside it, without changing directory — `wco down 2`,
+  `wco --isolated down 2`, `wco restart 2.1`, `wco logs 2.1 -f`, `wco exec 2.1 sh`.
+  A container ID resolves to its Compose service name; `down` acts on whole stacks
+  and rejects one.
+
+### Changed
+
+- Bump the `ports.json` state format to version 2, adding recorded stack IDs.
+  Version 1 files are read and upgraded in place on the next write.
+
+### Fixed
+
+- Resolve missing worktree-relative build contexts from the central WCO workspace when the same
+  path exists there, while preserving active-worktree resolution for bind mounts and build
+  contexts that are present in the checkout.
+
 ## [1.2.1] - 2026-08-03
 
 ### Changed
