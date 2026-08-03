@@ -5,13 +5,16 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
   release:
-    name: Build GitHub Release
+    name: Publish release
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/wco
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
       - name: Check out repository
@@ -44,6 +47,9 @@ jobs:
 
       - name: Build distributions
         run: uv build --clear
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
 
       - name: Create GitHub Release
         shell: bash

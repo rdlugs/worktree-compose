@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-03
+
+### Changed
+
+- Publish tagged release distributions to PyPI using GitHub Actions trusted
+  publishing.
+- Document installation of the published package with `uv`.
+
 ## [1.2.0] - 2026-08-03
 
 ### Added
@@ -109,7 +117,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Configurable Compose files, environment templates, and worktree validation.
 - Port inspection and explicit reallocation commands.
 
-[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/rdlugs/worktree-compose/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/rdlugs/worktree-compose/compare/v1.1.0...v1.2.0
 [1.1.1]: https://github.com/rdlugs/worktree-compose/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/rdlugs/worktree-compose/compare/v1.0.0...v1.1.0

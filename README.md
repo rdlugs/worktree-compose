@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/wco-logo.png" alt="WCO logo">
+  <img src="https://raw.githubusercontent.com/rdlugs/worktree-compose/main/docs/assets/wco-logo.png" alt="WCO logo">
 </p>
 
 <h1 align="center">wco</h1>
@@ -55,10 +55,10 @@ wco up -d --build                # the central stack, pointed here
 Install a self-contained copy with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-uv tool install /path/to/wco-source
+uv tool install wco
 ```
 
-While developing `wco`, install it in editable mode instead:
+To install from a source checkout while developing `wco`, use editable mode instead:
 
 ```bash
 uv tool install --editable /path/to/wco-source
