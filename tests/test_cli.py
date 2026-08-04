@@ -2176,7 +2176,9 @@ class TargetParsingTests(unittest.TestCase):
             self.assertIn("IDs start at 1", str(error.exception))
 
 
-class TargetDispatchTests(unittest.TestCase):
+class DispatchFixture(unittest.TestCase):
+    """A workspace whose 'feature' worktree holds stack ID 2, with exec_fn captured."""
+
     def setUp(self) -> None:
         self.fixture = WorkspaceFixture()
         self.feature = self.fixture.create_repo("feature")
@@ -2251,6 +2253,8 @@ class TargetDispatchTests(unittest.TestCase):
         )
         return result, captured, stdout.getvalue(), stderr.getvalue()
 
+
+class TargetDispatchTests(DispatchFixture):
     def test_a_stack_id_retargets_another_worktree(self) -> None:
         result, captured, _stdout, stderr = self._run(["down", "2"])
 
@@ -2354,6 +2358,175 @@ class TargetDispatchTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertTrue(any(command[-1] == "down" for command in commands))
+
+
+DEFAULT_SHELL_SHIM = [
+    "sh",
+    "-c",
+    "command -v bash >/dev/null 2>&1 && exec bash; exec sh",
+]
+
+
+class ExecShellTests(DispatchFixture):
+    """'wco exec' without a command opens a shell inside the target container."""
+
+    def _exec_run(self, argv: list[str]):
+        # Sub-IDs follow service-name order, so '2.1' is 'php'.
+        return self._run(argv, run_process=self._container_run(["php", "worker"]))
+
+    def test_an_id_without_a_command_appends_the_shell_shim(self) -> None:
+        result, captured, _stdout, stderr = self._exec_run(["exec", "2.1"])
+
+        self.assertEqual(result, 0, stderr)
+        self.assertEqual(
+            list(captured["args"])[-5:], ["exec", "php", *DEFAULT_SHELL_SHIM]
+        )
+
+    def test_a_service_without_a_command_appends_the_shell_shim(self) -> None:
+        result, captured, _stdout, stderr = self._exec_run(["exec", "php"])
+
+        self.assertEqual(result, 0, stderr)
+        self.assertEqual(
+            list(captured["args"])[-5:], ["exec", "php", *DEFAULT_SHELL_SHIM]
+        )
+
+    def test_an_explicit_shell_is_left_alone(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(["exec", "2.1", "bash"])
+
+        self.assertEqual(list(captured["args"])[-3:], ["exec", "php", "bash"])
+
+    def test_an_explicit_command_with_arguments_is_left_alone(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(
+            ["exec", "2.1", "ls", "-la"]
+        )
+
+        self.assertEqual(list(captured["args"])[-4:], ["exec", "php", "ls", "-la"])
+
+    def test_the_service_is_spliced_in_after_exec_options(self) -> None:
+        """Compose stops reading options at the first positional argument."""
+        _result, captured, _stdout, _stderr = self._exec_run(
+            ["exec", "2.1", "-u", "root"]
+        )
+
+        self.assertEqual(
+            list(captured["args"])[-7:],
+            ["exec", "-u", "root", "php", *DEFAULT_SHELL_SHIM],
+        )
+
+    def test_options_before_a_command_suppress_the_shim(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(
+            ["exec", "2.1", "-u", "root", "whoami"]
+        )
+
+        self.assertEqual(
+            list(captured["args"])[-5:], ["exec", "-u", "root", "php", "whoami"]
+        )
+
+    def test_an_inline_option_value_is_not_a_command(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(
+            ["exec", "2.1", "--index=2", "whoami"]
+        )
+
+        self.assertEqual(
+            list(captured["args"])[-4:], ["exec", "--index=2", "php", "whoami"]
+        )
+
+    def test_boolean_flags_do_not_count_as_a_command(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(["exec", "2.1", "-it"])
+
+        self.assertEqual(
+            list(captured["args"])[-6:],
+            ["exec", "-it", "php", *DEFAULT_SHELL_SHIM],
+        )
+
+    def test_a_flag_before_a_plain_service_is_handled(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(["exec", "-it", "php"])
+
+        self.assertEqual(
+            list(captured["args"])[-6:],
+            ["exec", "-it", "php", *DEFAULT_SHELL_SHIM],
+        )
+
+    def test_only_exec_reorders_the_service(self) -> None:
+        """'logs' and friends accept a service ahead of their flags."""
+        _result, captured, _stdout, _stderr = self._exec_run(["logs", "2.1", "-f"])
+
+        self.assertEqual(list(captured["args"])[-3:], ["logs", "php", "-f"])
+
+    def test_other_commands_are_untouched(self) -> None:
+        _result, captured, _stdout, _stderr = self._exec_run(["logs", "2.1"])
+
+        self.assertEqual(list(captured["args"])[-2:], ["logs", "php"])
+
+        _result, captured, _stdout, _stderr = self._exec_run(["restart", "2.1"])
+
+        self.assertEqual(list(captured["args"])[-2:], ["restart", "php"])
+
+    def test_a_configured_shell_replaces_the_default(self) -> None:
+        (self.fixture.workspace / ".wco.toml").write_text(
+            CONFIG + '\n[shell]\ndefault = "zsh"\nfallback = ["bash", "sh"]\n'
+        )
+
+        _result, captured, _stdout, _stderr = self._exec_run(["exec", "2.1"])
+
+        self.assertEqual(
+            list(captured["args"])[-1],
+            "command -v zsh >/dev/null 2>&1 && exec zsh; "
+            "command -v bash >/dev/null 2>&1 && exec bash; exec sh",
+        )
+
+    def test_a_single_candidate_needs_no_probe(self) -> None:
+        (self.fixture.workspace / ".wco.toml").write_text(
+            CONFIG + '\n[shell]\ndefault = "sh"\nfallback = []\n'
+        )
+
+        _result, captured, _stdout, _stderr = self._exec_run(["exec", "2.1"])
+
+        self.assertEqual(list(captured["args"])[-1], "exec sh")
+
+    def test_a_duplicated_fallback_is_collapsed(self) -> None:
+        (self.fixture.workspace / ".wco.toml").write_text(
+            CONFIG + '\n[shell]\ndefault = "bash"\nfallback = ["bash", "sh"]\n'
+        )
+
+        _result, captured, _stdout, _stderr = self._exec_run(["exec", "2.1"])
+
+        self.assertEqual(
+            list(captured["args"])[-1],
+            "command -v bash >/dev/null 2>&1 && exec bash; exec sh",
+        )
+
+
+class ShellConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = WorkspaceFixture()
+        self.addCleanup(self.fixture.close)
+        self.path = self.fixture.workspace / ".wco.toml"
+
+    def test_the_default_candidates_are_bash_then_sh(self) -> None:
+        self.assertEqual(load_config(self.path).shell.candidates, ("bash", "sh"))
+
+    def test_a_shell_name_with_a_metacharacter_is_rejected(self) -> None:
+        self.path.write_text(CONFIG + '\n[shell]\ndefault = "sh; rm -rf /"\n')
+
+        with self.assertRaises(WcoError) as error:
+            load_config(self.path)
+
+        self.assertIn("must contain only letters", str(error.exception))
+
+    def test_a_shell_name_with_a_space_is_rejected(self) -> None:
+        self.path.write_text(CONFIG + '\n[shell]\nfallback = ["bash -l"]\n')
+
+        with self.assertRaises(WcoError):
+            load_config(self.path)
+
+    def test_an_unknown_shell_key_is_rejected(self) -> None:
+        self.path.write_text(CONFIG + '\n[shell]\nshells = ["bash"]\n')
+
+        with self.assertRaises(WcoError) as error:
+            load_config(self.path)
+
+        self.assertIn("[shell]", str(error.exception))
 
 
 if __name__ == "__main__":

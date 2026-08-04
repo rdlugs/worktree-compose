@@ -7,6 +7,23 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Make the command optional in `wco exec`. `wco exec 2.1` — or `wco exec php` —
+  now opens an interactive shell instead of failing with a Compose usage error,
+  picking the first shell that exists inside the container. The candidates
+  default to `bash` then `sh` and are configurable per workspace with a new
+  `[shell]` table in `.wco.toml`. Passing a command keeps the previous
+  behaviour.
+
+### Fixed
+
+- Splice the service resolved from a container ID in after `exec`'s own options
+  rather than directly after the command. Docker Compose stops reading options
+  at the first positional argument, so `wco exec 2.1 -u root whoami` previously
+  produced `exec php -u root whoami` and failed with `"-u": executable file not
+  found in $PATH`. Other commands are unchanged.
+
 ## [1.3.0] - 2026-08-03
 
 ### Added
