@@ -141,6 +141,7 @@ wco down 2          # bring down stack 2, wherever you are
 wco restart 2.1     # restart just that container's service
 wco logs 2.1 -f     # ...the ID comes first, then the flags
 wco exec 2.1 sh
+wco exec 2.1        # ...or omit the command to drop into a shell
 ```
 
 A container ID resolves to its Compose service name, so it works with any command that accepts
@@ -150,6 +151,21 @@ option values such as `wco logs --tail 20` untouched; the same rule means a serv
 named `2` cannot be targeted this way. Stack IDs are recorded alongside port slots in `ports.json`
 (see [Port assignments and state](#port-assignments-and-state)) and are reused once the worktree
 they name is gone.
+
+**Opening a shell.** `wco exec` accepts a command as usual, but when none is given it opens an
+interactive shell in the target container:
+
+```bash
+wco exec 2.1          # a shell in that container
+wco exec php          # a shell in the shared stack's php service
+wco exec -u root 2.1  # a root shell; flags are preserved
+wco exec 2.1 whoami   # an explicit command still runs as-is
+```
+
+WCO does not guess which shell the image ships. It execs the first candidate that exists inside the
+container, defaulting to `bash` and falling back to `sh`, so the same command works on Alpine and
+Debian-based images. Set `[shell]` in `.wco.toml` (see
+[Configuration reference](#configuration-reference)) to change the order or add one, such as `zsh`.
 
 **Where containers run.** The `WORKTREE` column reports the worktree each listed container was
 actually created from — not the one you are standing in — and is highlighted when the two differ.
@@ -239,6 +255,11 @@ rewrite_ports = true
 HTTP_PORT = 8080
 DEV_PORT = 5173
 REDIS_PORT = 6379
+
+[shell]
+# Shells 'wco exec' tries, in order, when no command is given.
+default = "bash"
+fallback = ["sh"]
 ```
 
 `instance_name` defaults to `project_name`. All validation lists are optional and may be empty.

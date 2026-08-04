@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import socket
 import string
 import subprocess
@@ -31,6 +32,9 @@ TARGET_RE = re.compile(r"^(\d+)(?:\.(\d+))?$")
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SHELL_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+DEFAULT_SHELL = "bash"
+DEFAULT_SHELL_FALLBACK = ("sh",)
 STARTUP_COMMANDS = ("up", "create", "start", "restart", "run", "watch")
 BUILD_CONTEXT_COMMANDS = {"build", "up", "create", "run", "watch"}
 COMPOSE_COMMANDS = {
@@ -79,6 +83,7 @@ COMPOSE_OPTIONS_WITH_VALUES = {
     "--progress",
     "--project-directory",
 }
+EXEC_OPTIONS_WITH_VALUES = {"-e", "--env", "-u", "--user", "-w", "--workdir", "--index"}
 RESERVED_PROJECT_OPTIONS = {"-p", "--project-name"}
 ALLOWED_TEMPLATE_FIELDS = {"worktree", "workspace", "project", "instance"}
 COMPOSE_FILE_CANDIDATES = (
@@ -124,6 +129,13 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
+class ShellConfig:
+    """The shells 'wco exec <ID>' tries, in order, when no command is given."""
+
+    candidates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WorkspaceConfig:
     path: Path
     workspace: Path
@@ -133,6 +145,7 @@ class WorkspaceConfig:
     environment: dict[str, str]
     validation: ValidationConfig
     isolation: IsolationConfig
+    shell: ShellConfig
 
 
 @dataclass(frozen=True)
@@ -236,7 +249,11 @@ def load_config(path: Path) -> WorkspaceConfig:
 
     if not isinstance(data, dict):
         raise WcoError(f"{path} must contain a TOML table.")
-    _only_keys(data, {"version", "compose", "environment", "validation", "isolation"}, "root")
+    _only_keys(
+        data,
+        {"version", "compose", "environment", "validation", "isolation", "shell"},
+        "root",
+    )
     if data.get("version") != 1:
         raise WcoError(f"{path} must declare 'version = 1'.")
 
@@ -339,6 +356,24 @@ def load_config(path: Path) -> WorkspaceConfig:
             f"{', '.join(map(str, duplicate_ports))}."
         )
 
+    shell_table = _table(data, "shell")
+    _only_keys(shell_table, {"default", "fallback"}, "[shell]")
+    default_shell = shell_table.get("default", DEFAULT_SHELL)
+    if not isinstance(default_shell, str):
+        raise WcoError("'shell.default' must be a string.")
+    fallback_shells = _string_list(
+        shell_table.get("fallback"), "shell.fallback", DEFAULT_SHELL_FALLBACK
+    )
+    shell_candidates: list[str] = []
+    for candidate in (default_shell, *fallback_shells):
+        if not SHELL_RE.fullmatch(candidate):
+            raise WcoError(
+                f"Shell '{candidate}' must contain only letters, digits, '.', '_', "
+                "'-' or '/'."
+            )
+        if candidate not in shell_candidates:
+            shell_candidates.append(candidate)
+
     return WorkspaceConfig(
         path=path,
         workspace=workspace,
@@ -354,6 +389,7 @@ def load_config(path: Path) -> WorkspaceConfig:
             rewrite_container_names,
             rewrite_ports,
         ),
+        shell=ShellConfig(tuple(shell_candidates)),
     )
 
 
@@ -435,17 +471,66 @@ def split_target(arguments: Sequence[str]) -> tuple[list[str], Target | None]:
     return remaining, Target(stack=stack, container=container)
 
 
+def _service_insertion_index(arguments: Sequence[str], command_index: int) -> int:
+    """Where a resolved service name belongs, just past the command's own options.
+
+    'exec' stops parsing options at its first positional argument, so a service
+    spliced in ahead of them would swallow the flags as the command to run.
+    Other commands accept a service before their flags, so they keep the
+    original position.
+    """
+    if arguments[command_index] != "exec":
+        return command_index + 1
+    index = command_index + 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if not argument.startswith("-"):
+            break
+        index += 2 if argument in EXEC_OPTIONS_WITH_VALUES else 1
+    return min(index, len(arguments))
+
+
 def _insert_after_command(arguments: Sequence[str], extra: Sequence[str]) -> list[str]:
     if not extra:
         return list(arguments)
     command_index = _compose_command_index(arguments)
     if command_index is None:
         raise WcoError("Cannot locate the Docker Compose command.")
-    return [
-        *arguments[: command_index + 1],
-        *extra,
-        *arguments[command_index + 1 :],
-    ]
+    position = _service_insertion_index(arguments, command_index)
+    return [*arguments[:position], *extra, *arguments[position:]]
+
+
+def _exec_lacks_command(arguments: Sequence[str]) -> bool:
+    """True when this is an 'exec' that names a service but no command to run."""
+    command_index = _compose_command_index(arguments)
+    if command_index is None or arguments[command_index] != "exec":
+        return False
+    index = command_index + 1
+    seen_service = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if not argument.startswith("-"):
+            if seen_service:
+                return False
+            seen_service = True
+            index += 1
+            continue
+        if argument in EXEC_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        index += 1
+    return seen_service
+
+
+def _default_shell_arguments(shell: ShellConfig) -> list[str]:
+    """A 'sh -c' shim that execs the first configured shell present in the image."""
+    *probed, last = shell.candidates
+    script = "".join(
+        f"command -v {shlex.quote(candidate)} >/dev/null 2>&1 && "
+        f"exec {shlex.quote(candidate)}; "
+        for candidate in probed
+    )
+    return ["sh", "-c", f"{script}exec {shlex.quote(last)}"]
 
 
 def reject_reserved_arguments(arguments: Sequence[str]) -> None:
@@ -2602,6 +2687,9 @@ project, isolated worktrees are numbered from 2, and '2.1' addresses a single
 container inside stack 2. Because only that one position is read as an ID,
 put it before any flags: 'wco logs 2.1 -f', not 'wco logs -f 2.1'.
 
+'wco exec' without a command opens an interactive shell, trying each shell in
+the [shell] table of .wco.toml in turn ('bash' then 'sh' by default).
+
 Options:
   --isolated   Use a worktree-specific project name and persistent port slot.
   --format     Select table or JSON output for wco ports and wco stacks.
@@ -2620,6 +2708,8 @@ Examples:
   wco down 2
   wco restart 2.1
   wco logs 2.1 -f
+  wco exec 2.1
+  wco exec 2.1 php -v
   wco ports show
   wco ports show --all
   wco stacks --all
@@ -2685,6 +2775,14 @@ def run(
             arguments = _insert_after_command(arguments, extra)
 
         invocation = prepare_invocation(arguments, isolated, cwd)
+        if _exec_lacks_command(invocation.compose_args):
+            invocation = replace(
+                invocation,
+                compose_args=(
+                    *invocation.compose_args,
+                    *_default_shell_arguments(invocation.config.shell),
+                ),
+            )
         override = prepare_isolation_override(invocation, run_process)
         is_startup = (
             isolated
