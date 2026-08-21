@@ -101,7 +101,7 @@ def wide_terminal(fixture: "WorkspaceFixture"):
 class WorkspaceFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         (self.workspace / ".wco.toml").write_text(CONFIG)
