@@ -292,8 +292,8 @@ class Output:
         self.stdout.print()
         self._hint(
             self.stdout,
-            "Next: use worktree-relative Compose paths and add any published "
-            "port variables to [isolation.ports].",
+            "Next: matching worktree-relative Compose paths override this canonical "
+            "fallback; add any published port variables to [isolation.ports].",
         )
 
     def ports(

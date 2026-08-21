@@ -161,6 +161,7 @@ class Invocation:
     slot: int | None
     ports: dict[str, int]
     environment: dict[str, str]
+    compose_files: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,14 @@ class IsolationOverride:
     ports: dict[str, tuple[dict[str, object], ...]]
     rewritten_ports: int
     build_contexts: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _WorktreeComposeCandidate:
+    path: Path
+    worktree: Path
+    common_directory: Path
+    primary_worktree: Path
 
 
 def _table(data: Mapping[str, object], name: str) -> Mapping[str, object]:
@@ -408,6 +417,58 @@ def resolve_worktree(cwd: Path) -> Path:
     return Path(result.stdout.strip()).resolve()
 
 
+def _try_resolve_worktree(cwd: Path) -> Path | None:
+    """Return the Git worktree containing cwd, or None when cwd is not in one."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise WcoError(f"Cannot run Git: {exc}") from exc
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def _git_common_directory(worktree: Path) -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise WcoError(f"Cannot run Git: {exc}") from exc
+    if result.returncode != 0:
+        raise WcoError(f"Cannot inspect Git worktree '{worktree}'.")
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = worktree / common
+    return common.resolve()
+
+
+def _primary_worktree(worktree: Path) -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "worktree", "list", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise WcoError(f"Cannot run Git: {exc}") from exc
+    if result.returncode != 0:
+        raise WcoError(f"Cannot list Git worktrees from '{worktree}'.")
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            return Path(line.removeprefix("worktree ")).resolve()
+    raise WcoError(f"Git returned no worktrees for '{worktree}'.")
+
+
 def find_config(worktree: Path) -> Path:
     for directory in (worktree, *worktree.parents):
         candidate = directory / CONFIG_NAME
@@ -416,6 +477,30 @@ def find_config(worktree: Path) -> Path:
     raise WcoError(
         f"No {CONFIG_NAME} was found in '{worktree}' or any parent directory."
     )
+
+
+def _compose_source_root(config: WorkspaceConfig, compose_file: Path) -> Path:
+    """The root used to map a canonical Compose file into another worktree."""
+    source_worktree = _try_resolve_worktree(compose_file.parent)
+    if source_worktree is not None and source_worktree.is_relative_to(config.workspace):
+        return source_worktree
+    return config.workspace
+
+
+def _resolve_worktree_compose_files(
+    config: WorkspaceConfig, worktree: Path
+) -> tuple[Path, ...]:
+    """Prefer each configured file's equivalent in the active worktree."""
+    resolved: list[Path] = []
+    for fallback in config.compose_files:
+        source_root = _compose_source_root(config, fallback)
+        relative = fallback.relative_to(source_root)
+        candidate = (worktree / relative).resolve()
+        if candidate.is_relative_to(worktree) and candidate.is_file():
+            resolved.append(candidate)
+        else:
+            resolved.append(fallback)
+    return tuple(resolved)
 
 
 def _compose_command_index(arguments: Sequence[str]) -> int | None:
@@ -608,14 +693,80 @@ def _parse_init_arguments(arguments: Sequence[str]) -> tuple[str | None, str | N
     return compose_file, project_name, force
 
 
+def _standard_compose_file(directory: Path) -> Path | None:
+    for filename in COMPOSE_FILE_CANDIDATES:
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _worktree_compose_files(
+    directory: Path,
+) -> list[_WorktreeComposeCandidate]:
+    """Compose candidates in immediate child Git worktrees.
+
+    Each result contains the Compose file, worktree root, common Git directory,
+    and primary worktree root.
+    """
+    discovered: list[_WorktreeComposeCandidate] = []
+    try:
+        children = sorted(directory.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise WcoError(f"Cannot inspect '{directory}': {exc}") from exc
+    for child in children:
+        if child.is_symlink() or not child.is_dir():
+            continue
+        child = child.resolve()
+        worktree = _try_resolve_worktree(child)
+        if worktree != child:
+            continue
+        compose_file = _standard_compose_file(worktree)
+        if compose_file is None:
+            continue
+        discovered.append(
+            _WorktreeComposeCandidate(
+                path=compose_file,
+                worktree=worktree,
+                common_directory=_git_common_directory(worktree),
+                primary_worktree=_primary_worktree(worktree),
+            )
+        )
+    return discovered
+
+
 def _init_compose_file(directory: Path, requested: str | None) -> str:
     if requested is None:
-        for filename in COMPOSE_FILE_CANDIDATES:
-            if (directory / filename).is_file():
-                return filename
+        direct = _standard_compose_file(directory)
+        if direct is not None:
+            return direct.relative_to(directory).as_posix()
+
+        discovered = _worktree_compose_files(directory)
+        if len(discovered) == 1:
+            return discovered[0].path.relative_to(directory).as_posix()
+        if discovered:
+            repositories = {item.common_directory for item in discovered}
+            primary = [
+                item
+                for item in discovered
+                if item.worktree == item.primary_worktree
+            ]
+            if len(repositories) == 1 and len(primary) == 1:
+                return primary[0].path.relative_to(directory).as_posix()
+            choices = "\n".join(
+                f"  - {item.path.relative_to(directory).as_posix()}"
+                for item in discovered
+            )
+            raise WcoError(
+                "Multiple Compose files were found in Git worktrees, but no single "
+                f"primary-worktree candidate can be selected:\n{choices}\n"
+                "Use '--compose PATH' to choose the canonical fallback."
+            )
+
         candidates = ", ".join(COMPOSE_FILE_CANDIDATES)
         raise WcoError(
-            f"No Compose file was found in '{directory}'. Expected one of: {candidates}. "
+            f"No Compose file was found in '{directory}' or its immediate Git "
+            f"worktrees. Expected one of: {candidates}. "
             "Use '--compose PATH' to select another file."
         )
 
@@ -1180,7 +1331,10 @@ def _container_override_path(
         {
             "config": str(invocation.config.path),
             "worktree": str(invocation.worktree),
-            "files": [str(path) for path in invocation.config.compose_files],
+            "files": [
+                str(path)
+                for path in invocation.compose_files or invocation.config.compose_files
+            ],
             "global_arguments": _compose_global_arguments(invocation.compose_args),
         },
         separators=(",", ":"),
@@ -1348,10 +1502,14 @@ def _write_isolation_override(path: Path, override: IsolationOverride) -> None:
 
 
 def build_compose_prefix(
-    config: WorkspaceConfig, project_name: str, project_directory: Path
+    config: WorkspaceConfig,
+    project_name: str,
+    project_directory: Path,
+    *,
+    compose_files: Sequence[Path] | None = None,
 ) -> list[str]:
     command = ["docker", "compose", "--project-name", project_name]
-    for compose_file in config.compose_files:
+    for compose_file in config.compose_files if compose_files is None else compose_files:
         command.extend(["--file", str(compose_file)])
     command.extend(["--project-directory", str(project_directory)])
     return command
@@ -1370,6 +1528,7 @@ def build_invocation_command(
         invocation.config,
         invocation.project_name,
         invocation.worktree,
+        compose_files=invocation.compose_files or invocation.config.compose_files,
     )
     command.extend(arguments[:command_index])
     if override is not None:
@@ -1670,6 +1829,7 @@ def prepare_invocation(
     cwd = (cwd or Path.cwd()).resolve()
     worktree = resolve_worktree(cwd)
     config = load_config(find_config(worktree))
+    compose_files = _resolve_worktree_compose_files(config, worktree)
     reject_reserved_arguments(compose_args)
     command = compose_command(compose_args)
     validate_worktree(config, worktree, command)
@@ -1698,6 +1858,7 @@ def prepare_invocation(
     return Invocation(
         worktree=worktree,
         config=config,
+        compose_files=compose_files,
         isolated=isolated,
         compose_args=tuple(compose_args),
         compose_command=command,
@@ -2646,6 +2807,7 @@ def _run_pretty_ps(
 INIT_HELP = """Usage: wco init [OPTIONS]
 
 Create .wco.toml in the current directory.
+If no Compose file is present there, inspect immediate child Git worktrees.
 
 Options:
   --compose PATH   Use this Compose file instead of automatic detection.
@@ -2677,9 +2839,10 @@ HELP = """Usage: wco [--isolated] <command> [ID] [docker compose arguments]
        wco ports <show|reallocate> [--all] [--format table|json]
        wco stacks [--all] [--format table|json]
 
-Run a workspace's central Docker Compose configuration against the current
-Git worktree. The nearest .wco.toml at or above the worktree defines the
-Compose files, environment, validation rules, and isolated ports.
+Run a workspace's Docker Compose configuration against the current Git
+worktree. The nearest .wco.toml at or above the worktree defines canonical
+Compose fallbacks, environment, validation rules, and isolated ports. A
+matching Compose path in the active worktree takes precedence.
 
 An optional ID directly after the Compose command targets another stack
 without changing directory. 'wco stacks' lists the IDs: stack 1 is the shared
