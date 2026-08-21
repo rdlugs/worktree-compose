@@ -7,6 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-21
+
+### Added
+
+- Let `wco init` discover standard Compose files in immediate child Git worktrees when the current
+  directory has none, preferring the primary worktree and reporting ambiguous candidates for
+  explicit selection with `--compose`.
+
+### Changed
+
+- Prefer each configured Compose file's equivalent in the active or targeted worktree, while
+  retaining the configured path as a canonical fallback when that worktree has no copy.
+
 ## [1.4.0] - 2026-08-04
 
 ### Added
@@ -161,7 +174,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Configurable Compose files, environment templates, and worktree validation.
 - Port inspection and explicit reallocation commands.
 
-[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/rdlugs/worktree-compose/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/rdlugs/worktree-compose/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/rdlugs/worktree-compose/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/rdlugs/worktree-compose/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/rdlugs/worktree-compose/compare/v1.2.0...v1.2.1

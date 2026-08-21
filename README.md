@@ -70,15 +70,30 @@ uv tool install --editable /path/to/wco-source
 
 ## Initialize a workspace
 
-Run `init` in the directory that contains the central Compose file:
+Run `init` in the directory that contains the canonical Compose file:
 
 ```bash
 wco init
 ```
 
 `wco` detects `compose.yaml`, `compose.yml`, `docker-compose.yaml`, or `docker-compose.yml`,
-derives the project name from the directory, and creates `.wco.toml`. Override those defaults
-when needed:
+derives the project name from the directory, and creates `.wco.toml`. If none of those files is
+present, it checks immediate child directories that are registered Git worktree roots. This makes
+it possible to initialize a directory that groups sibling worktrees:
+
+```text
+sfav2/
+├── deploy-prd/
+└── uat-from-prd/
+    └── docker-compose.yml
+```
+
+When only one worktree contains a Compose file, WCO records it as the canonical fallback. When
+several linked worktrees contain one, WCO uses the primary worktree's file. If the primary
+worktree has none—or candidates belong to unrelated repositories—initialization lists the
+choices and requires `--compose PATH`.
+
+Override the detected file or project name when needed:
 
 ```bash
 wco init --compose deploy/compose.yml --project example
@@ -88,6 +103,8 @@ wco init --force
 Things worth knowing:
 
 - Initialization never changes the Compose file.
+- For every configured Compose file, WCO first checks for the same worktree-relative path in the
+  active or explicitly targeted worktree. If it is absent, WCO uses the configured canonical file.
 - Relative Compose paths such as `./` resolve from the **active worktree**, and Docker Compose
   loads `.env` from that worktree for interpolation.
 - If a relative build context is absent from the active worktree but the same path exists beside
@@ -227,9 +244,11 @@ wco ports reallocate --format=json
 
 ## Configuration reference
 
-Place `.wco.toml` beside the central Compose file. The configuration may also live in a normal
-repository root; `wco` searches from the detected Git worktree toward the filesystem root and uses
-the nearest configuration.
+Place `.wco.toml` beside the canonical Compose file or in a parent directory that groups Git
+worktrees. The configuration may also live in a normal repository root; `wco` searches from the
+detected Git worktree toward the filesystem root and uses the nearest configuration. Entries in
+`compose.files` are canonical fallbacks: a matching relative path in the active worktree takes
+precedence.
 
 ```toml
 version = 1

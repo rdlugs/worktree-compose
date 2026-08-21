@@ -134,6 +134,48 @@ class InitTests(unittest.TestCase):
         result = run(arguments, cwd=self.workspace, stdout=stdout, stderr=stderr)
         return result, stdout.getvalue(), stderr.getvalue()
 
+    def create_worktrees(self, *linked_names: str) -> tuple[Path, ...]:
+        primary = self.workspace / "primary"
+        primary.mkdir()
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        (primary / "tracked.txt").write_text("initial\n")
+        subprocess.run(["git", "-C", str(primary), "add", "tracked.txt"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "-c",
+                "user.name=WCO Tests",
+                "-c",
+                "user.email=wco@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            check=True,
+        )
+        worktrees = [primary]
+        for name in linked_names:
+            linked = self.workspace / name
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(primary),
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    name,
+                    str(linked),
+                ],
+                check=True,
+            )
+            worktrees.append(linked)
+        return tuple(worktrees)
+
     def test_init_detects_compose_file_and_derives_project_name(self) -> None:
         (self.workspace / "docker-compose.yml").write_text("services: {}\n")
 
@@ -165,6 +207,70 @@ class InitTests(unittest.TestCase):
         self.assertEqual(result, 0)
         config = load_config(self.workspace / ".wco.toml")
         self.assertEqual(config.compose_files, (self.workspace / "compose.yaml",))
+
+    def test_init_prefers_current_directory_over_worktree_files(self) -> None:
+        _, feature = self.create_worktrees("feature")
+        (self.workspace / "docker-compose.yml").write_text("services: {}\n")
+        (feature / "compose.yaml").write_text("services: {}\n")
+
+        result, _, stderr = self.invoke(["init"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        config = load_config(self.workspace / ".wco.toml")
+        self.assertEqual(
+            config.compose_files,
+            (self.workspace / "docker-compose.yml",),
+        )
+
+    def test_init_discovers_compose_file_in_only_matching_worktree(self) -> None:
+        primary, feature = self.create_worktrees("feature")
+        (feature / "docker-compose.yml").write_text("services: {}\n")
+
+        result, _, stderr = self.invoke(["init"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        config = load_config(self.workspace / ".wco.toml")
+        self.assertEqual(config.compose_files, (feature / "docker-compose.yml",))
+        self.assertFalse((primary / "docker-compose.yml").exists())
+
+    def test_init_prefers_primary_worktree_compose_file(self) -> None:
+        primary, feature = self.create_worktrees("feature")
+        (primary / "docker-compose.yml").write_text("services: {}\n")
+        (feature / "docker-compose.yml").write_text("services: {}\n")
+
+        result, _, stderr = self.invoke(["init"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        config = load_config(self.workspace / ".wco.toml")
+        self.assertEqual(config.compose_files, (primary / "docker-compose.yml",))
+
+    def test_init_lists_ambiguous_non_primary_worktree_files(self) -> None:
+        _, first, second = self.create_worktrees("first", "second")
+        (first / "docker-compose.yml").write_text("services: {}\n")
+        (second / "docker-compose.yml").write_text("services: {}\n")
+
+        result, _, stderr = self.invoke(["init"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("Multiple Compose files", stderr)
+        self.assertIn("first/docker-compose.yml", stderr)
+        self.assertIn("second/docker-compose.yml", stderr)
+        self.assertIn("--compose PATH", stderr)
+        self.assertFalse((self.workspace / ".wco.toml").exists())
+
+    def test_init_ignores_compose_file_in_non_worktree_directory(self) -> None:
+        ordinary = self.workspace / "ordinary"
+        ordinary.mkdir()
+        (ordinary / "docker-compose.yml").write_text("services: {}\n")
+
+        result, _, stderr = self.invoke(["init"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("No Compose file was found", stderr)
+        self.assertFalse((self.workspace / ".wco.toml").exists())
 
     def test_init_accepts_custom_compose_file_and_project(self) -> None:
         deploy = self.workspace / "deploy"
@@ -299,6 +405,48 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(invocation.worktree, self.fixture.main.resolve())
         self.assertEqual(invocation.environment["SOURCE_PATH"], str(self.fixture.main.resolve()))
         self.assertEqual(invocation.ports["HTTP_PORT"], 8000)
+
+    def test_prefers_active_worktree_compose_file(self) -> None:
+        active = self.fixture.main / "docker-compose.yml"
+        active.write_text("services:\n  active: {}\n")
+
+        invocation = prepare_invocation(["config"], False, self.fixture.main)
+
+        self.assertEqual(invocation.compose_files, (active.resolve(),))
+        self.assertEqual(
+            invocation.config.compose_files,
+            (self.fixture.workspace / "docker-compose.yml",),
+        )
+        command = build_invocation_command(invocation)
+        self.assertIn(str(active.resolve()), command)
+        self.assertNotIn(str(self.fixture.workspace / "docker-compose.yml"), command)
+
+    def test_uses_canonical_compose_file_when_worktree_copy_is_missing(self) -> None:
+        invocation = prepare_invocation(["config"], False, self.fixture.main)
+
+        self.assertEqual(
+            invocation.compose_files,
+            (self.fixture.workspace / "docker-compose.yml",),
+        )
+
+    def test_maps_nested_canonical_worktree_file_to_active_worktree(self) -> None:
+        central = self.fixture.workspace / "docker-compose.yml"
+        central.unlink()
+        canonical = self.fixture.main / "docker-compose.yml"
+        canonical.write_text("services:\n  canonical: {}\n")
+        (self.fixture.workspace / ".wco.toml").write_text(
+            CONFIG.replace(
+                'files = ["docker-compose.yml"]',
+                'files = ["main/docker-compose.yml"]',
+            )
+        )
+        feature = self.fixture.create_repo("feature")
+        active = feature / "docker-compose.yml"
+        active.write_text("services:\n  active: {}\n")
+
+        invocation = prepare_invocation(["config"], False, feature)
+
+        self.assertEqual(invocation.compose_files, (active.resolve(),))
 
     def test_startup_requires_env_but_config_does_not(self) -> None:
         prepare_invocation(["config"], False, self.fixture.main)
